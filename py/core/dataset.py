@@ -55,20 +55,18 @@ class FastChessDataset(Dataset):
             ep_row = ep_idx // 8
             ep_col = ep_idx % 8
             tensor[14, ep_row, ep_col] = 1.0
-
-        target = np.tanh(self.targets[idx] / 4.0)
+            
+        target = self.targets[idx] / 10.0 
         return tensor, torch.tensor([target], dtype=torch.float32)
     
-def clean_eval(val):
-    val = str(val).strip()
-    if '#' in val:
-        score = 15.0 if '-' not in val else -15.0
-    else:
-        score = float(val.replace('+', '')) / 100.0
-
-    score = max(-15.0, min(15.0, score))
-    # Сжимаем оценку. 4 пешки преимущества дадут значение ~0.76, 15 пешек дадут ~0.99
-    return math.tanh(score / 4.0)
+def clean_eval(eval_str):
+    eval_str = str(eval_str).strip()
+    if eval_str.startswith('\ufeff'): eval_str = eval_str[1:]
+    if eval_str.startswith('#'):
+        return 10.0 if eval_str[1] == '+' else -10.0
+    
+    eval_pawns = float(eval_str) / 100.0
+    return max(-10.0, min(10.0, eval_pawns)) 
 
 # Словарь для токенизации (0-11 для фигур, 12 - для пустой клетки)
 CHAR_TO_INT_TOKEN = {

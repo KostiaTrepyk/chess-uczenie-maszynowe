@@ -2,7 +2,7 @@ from core.dataset import load_dataset, prepare_dataset
 from core.model import show_model_stats, train_model
 
 # Загрузка данных, обучение модели 
-df = load_dataset(1_000_000)
+df = load_dataset(5_000_000)
 
 train_loader, val_loader = prepare_dataset(df)
 

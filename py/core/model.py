@@ -35,30 +35,54 @@ class ResidualBlock(nn.Module):
         out += residual
         return self.leaky_relu(out)
 
+# class ChessResNet(nn.Module):
+#     def __init__(self, num_blocks=10): 
+#         super().__init__()
+#         self.input_conv = nn.Sequential(
+#             nn.Conv2d(15, 128, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(128),
+#             nn.LeakyReLU(0.1)
+#         )
+
+#         # Динамически создаем нужное количество блоков с помощью генератора
+#         self.resnet_blocks = nn.Sequential(
+#             *[ResidualBlock(128) for _ in range(num_blocks)]
+#         )
+
+#         self.value_head = nn.Sequential(
+#             nn.Conv2d(128, 8, kernel_size=1),
+#             nn.BatchNorm2d(8),
+#             nn.LeakyReLU(0.1),
+#             nn.Flatten(),
+#             nn.Linear(8 * 8 * 8, 256),
+#             nn.LeakyReLU(0.1),
+#             nn.Dropout(0.3),
+#             nn.Linear(256, 1),
+#             nn.Tanh()
+#         )
 class ChessResNet(nn.Module):
-    def __init__(self, num_blocks=10): 
+    def __init__(self, num_blocks=12): # Чуть глубже
         super().__init__()
         self.input_conv = nn.Sequential(
-            nn.Conv2d(15, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(15, 256, kernel_size=3, padding=1), # <-- Расширили до 256
+            nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1)
         )
 
-        # Динамически создаем нужное количество блоков с помощью генератора
         self.resnet_blocks = nn.Sequential(
-            *[ResidualBlock(128) for _ in range(num_blocks)]
+            *[ResidualBlock(256) for _ in range(num_blocks)] # <-- Расширили до 256
         )
 
         self.value_head = nn.Sequential(
-            nn.Conv2d(128, 8, kernel_size=1),
-            nn.BatchNorm2d(8),
+            nn.Conv2d(256, 16, kernel_size=1), # Больше информации идет в голову
+            nn.BatchNorm2d(16),
             nn.LeakyReLU(0.1),
             nn.Flatten(),
-            nn.Linear(8 * 8 * 8, 256),
+            nn.Linear(16 * 8 * 8, 512), # <-- Увеличили скрытый слой в 2 раза
             nn.LeakyReLU(0.1),
             nn.Dropout(0.3),
-            nn.Linear(256, 1),
-            nn.Tanh()
+            nn.Linear(512, 1),
+            nn.Tanh() # Здесь Tanh оставляем для гарантии, что сеть не выдаст число > 1
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
