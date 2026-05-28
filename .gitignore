@@ -1,0 +1,26 @@
+# 1. Виртуальное окружение (Никогда не пушим, оно у каждого свое)
+py/venv/
+venv/
+env/
+
+# 2. Кэш Python и VS Code
+__pycache__/
+*.py[cod]
+*$py.class
+.vscode/
+
+# 3. Датасеты и большие архивы (GitHub не пропустит файлы > 100MB)
+*.csv
+*.tar.gz
+*.zip
+py/chessData.csv
+py/chess_premium.tar.gz
+
+# 4. Веса нейросети (Обычно хранятся в облаке, а не в Git)
+*.pth
+*.pt
+*.onnx
+
+# 5. Логи и системные файлы
+*.log
+.DS_Store
