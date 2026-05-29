@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
 from core.features import tokenize_fen, clean_eval_to_class
+from core.consts import batch_size
 
 class FastChessDataset(Dataset):
     def __init__(self, df: DataFrame):
@@ -42,7 +43,7 @@ class FastChessDataset(Dataset):
         
         return board, turn, castling, ep, torch.tensor(target_class, dtype=torch.long)
 
-def prepare_dataset(df: DataFrame) -> tuple[DataLoader, DataLoader]:
+def prepare_dataset_with_split(df: DataFrame) -> tuple[DataLoader, DataLoader]:
     print('\nPrzygotowanie zestawu danych...')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     is_cuda = (device.type == 'cuda')
@@ -55,7 +56,7 @@ def prepare_dataset(df: DataFrame) -> tuple[DataLoader, DataLoader]:
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=1024,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=0,
         pin_memory=is_cuda,
@@ -64,7 +65,7 @@ def prepare_dataset(df: DataFrame) -> tuple[DataLoader, DataLoader]:
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=1024,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=0,
         pin_memory=is_cuda,
@@ -73,6 +74,25 @@ def prepare_dataset(df: DataFrame) -> tuple[DataLoader, DataLoader]:
     
     print('Przygotowanie zestawu danych zakończone.')
     return train_loader, val_loader
+
+def prepare_dataset(df: DataFrame) -> DataLoader:
+    print('\nPrzygotowanie zestawu danych...')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    is_cuda = (device.type == 'cuda')
+
+    dataset = FastChessDataset(df)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=is_cuda,
+        persistent_workers=False
+    )
+    
+    print('Przygotowanie zestawu danych zakończone.')
+    return loader
 
 def load_dataset(n: int | None = None) -> DataFrame:
     print('\nŁadowanie danych...')

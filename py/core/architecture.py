@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from core.consts import num_blocks, channels, kernel_size, padding
+
 class TransformerBlock(nn.Module):
     def __init__(self, channels: int, heads: int = 4):
         super().__init__()
@@ -90,15 +92,15 @@ class ResidualBlock(nn.Module):
         return self.leaky_relu(out)
 
 class ChessResNet(nn.Module):
-    def __init__(self, num_blocks=10):
+    def __init__(self, num_blocks=num_blocks, channels=channels):
         super().__init__()
         
         # Blok wejściowy. 
         # Zmienia początkową reprezentację planszy (15 warstw wejściowych: bierki, kolej ruchu, roszada, en passant) 
         # na bogatszą reprezentację wielowymiarową (256 kanałów cech).
         self.input_conv = nn.Sequential(
-            nn.Conv2d(15, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(15, channels, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm2d(channels),
             nn.LeakyReLU(0.1)
         )
 
@@ -106,28 +108,28 @@ class ChessResNet(nn.Module):
         # Składa się z serii bloków rezydualnych (domyślnie 10). 
         # Służy do głębokiej ekstrakcji cech lokalnych (np. kontrola centrum, bezpieczeństwo króla).
         self.resnet_blocks = nn.Sequential(
-            *[ResidualBlock(256) for _ in range(num_blocks)]
+            *[ResidualBlock(channels) for _ in range(num_blocks)]
         )
 
         # <-- TUTAJ DODAJEMY TRANSFORMER -->
         # Blok Transformera dodaje globalny kontekst (globalny "ogląd" sytuacji).
         # Pozwala sieci natychmiast powiązać figury znajdujące się na przeciwległych końcach planszy.
-        self.transformer = TransformerBlock(channels=256, heads=4)
+        self.transformer = TransformerBlock(channels=channels, heads=8)
 
         # Głowica oceniająca (Value Head). 
         # Przekształca wyodrębnione cechy w ostateczną ocenę pozycji.
         self.value_head = nn.Sequential(
-            # Konwolucja 1x1 kompresuje liczbę kanałów z 256 na 16. 
+            # Konwolucja 1x1 kompresuje liczbę kanałów z 256 na 32. 
             # Drastycznie zmniejsza to liczbę parametrów przed warstwą w pełni połączoną (Linear), oszczędzając pamięć.
-            nn.Conv2d(256, 16, kernel_size=1), 
-            nn.BatchNorm2d(16),
+            nn.Conv2d(channels, 32, kernel_size=1), 
+            nn.BatchNorm2d(32),
             nn.LeakyReLU(0.1),
             
             # Spłaszczanie danych z formatu 2D (kanały, wysokość, szerokość) do wektora 1D
             nn.Flatten(),
             
             # Główna warstwa decyzyjna z 512 neuronami
-            nn.Linear(16 * 8 * 8, 512), 
+            nn.Linear(32 * 8 * 8, 1024), 
             nn.LeakyReLU(0.1),
             
             # Zapobiega przeuczeniu (overfitting) poprzez losowe ignorowanie 30% neuronów podczas trenowania
@@ -136,7 +138,7 @@ class ChessResNet(nn.Module):
             # Wyjście sieci. 
             # Sieć nie przewiduje jednej liczby, ale dokonuje klasyfikacji do jednego ze 100 "koszyków".
             # Koszyki te reprezentują ocenę pozycji w zakresie od -10.0 do +10.0 pionów.
-            nn.Linear(512, 100),
+            nn.Linear(1024, 100),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -154,15 +156,16 @@ class ChessResNet(nn.Module):
         # 4. Agregacja wyników i ostateczna predykcja (100 logitów dla każdego z koszyków)
         return self.value_head(x)
 
-def load_model()-> ChessResNet:
+def load_model(num_blocks=num_blocks, channels=channels)-> ChessResNet:
     # Wczytujemy gotowy model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 2. Tworzymy pustą architekturę sieci i przenosimy na urządzenie
-    model = ChessResNet(num_blocks=10).to(device)
+    model = ChessResNet(num_blocks, channels).to(device)
 
     # 3. Wczytujemy wagi z pliku
     # map_location gwarantuje poprawne wczytanie, nawet jeśli model był trenowany na GPU a uruchamiany na CPU
+    print(f'Wczytywanie modelu z pliku: best_chess_model.pth')
     model.load_state_dict(torch.load("best_chess_model.pth", map_location=device))
 
     # 4. Koniecznie przełączamy na tryb predykcji (eval)

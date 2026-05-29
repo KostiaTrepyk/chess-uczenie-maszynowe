@@ -41,7 +41,7 @@ pip install torch --index-url [https://download.pytorch.org/whl/cu126](https://d
 ## Przykład aktywacji środowiska wirtualnego na Windows (PowerShell/CMD)
 
 ```bash
-cd py/venv/Scripts
+cd ./py/venv/Scripts
 activate
 cd ../..
 ```

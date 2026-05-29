@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import tqdm
+from tqdm import tqdm
 
 from core.architecture import ChessResNet
 from core.features import build_batch_on_gpu
@@ -14,7 +14,7 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
     # Włączamy akcelerację sprzętową dla sieci splotowych (Daje +10-15% do szybkości)
     torch.backends.cudnn.benchmark = True
 
-    model = ChessResNet(num_blocks=10).to(device)
+    model = ChessResNet().to(device)
     
     # Kompilacja modelu dla PyTorch 2.0+ (Daje jeszcze +20% do szybkości). W razie błędu na Windowsie - po prostu usuń tę linię.
     # model = torch.compile(model) 
