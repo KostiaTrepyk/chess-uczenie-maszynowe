@@ -5,6 +5,28 @@ from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from typing import List
 
+class TransformerBlock(nn.Module):
+    def __init__(self, channels: int, heads: int = 4):
+        super().__init__()
+        # Внимание: 4 "головы" будут искать разные паттерны (связки, защиту короля и т.д.)
+        self.attention = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, batch_first=True)
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.size()
+        
+        # Разворачиваем доску 8x8 в последовательность из 64 клеток для трансформера
+        x_flat = x.view(b, c, h * w).permute(0, 2, 1) # Форма: (Batch, 64, Channels)
+        
+        # Сеть "смотрит" сама на себя, находя скрытые связи между клетками
+        attn_out, _ = self.attention(x_flat, x_flat, x_flat)
+        
+        # Добавляем исходные данные и нормализуем (Residual connection)
+        out = self.norm(x_flat + attn_out)
+        
+        # Сворачиваем обратно в классическую форму доски
+        return out.permute(0, 2, 1).view(b, c, h, w)
+    
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
@@ -35,65 +57,60 @@ class ResidualBlock(nn.Module):
         out += residual
         return self.leaky_relu(out)
 
-# class ChessResNet(nn.Module):
-#     def __init__(self, num_blocks=10): 
-#         super().__init__()
-#         self.input_conv = nn.Sequential(
-#             nn.Conv2d(15, 128, kernel_size=3, padding=1),
-#             nn.BatchNorm2d(128),
-#             nn.LeakyReLU(0.1)
-#         )
-
-#         # Динамически создаем нужное количество блоков с помощью генератора
-#         self.resnet_blocks = nn.Sequential(
-#             *[ResidualBlock(128) for _ in range(num_blocks)]
-#         )
-
-#         self.value_head = nn.Sequential(
-#             nn.Conv2d(128, 8, kernel_size=1),
-#             nn.BatchNorm2d(8),
-#             nn.LeakyReLU(0.1),
-#             nn.Flatten(),
-#             nn.Linear(8 * 8 * 8, 256),
-#             nn.LeakyReLU(0.1),
-#             nn.Dropout(0.3),
-#             nn.Linear(256, 1),
-#             nn.Tanh()
-#         )
 class ChessResNet(nn.Module):
-    def __init__(self, num_blocks=12): # Чуть глубже
+    def __init__(self, num_blocks=10):
         super().__init__()
         self.input_conv = nn.Sequential(
-            nn.Conv2d(15, 256, kernel_size=3, padding=1), # <-- Расширили до 256
+            nn.Conv2d(15, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1)
         )
 
         self.resnet_blocks = nn.Sequential(
-            *[ResidualBlock(256) for _ in range(num_blocks)] # <-- Расширили до 256
+            *[ResidualBlock(256) for _ in range(num_blocks)]
         )
 
+        # <-- ДОБАВЛЯЕМ ТРАНСФОРМЕР СЮДА -->
+        self.transformer = TransformerBlock(channels=256, heads=4)
+
         self.value_head = nn.Sequential(
-            nn.Conv2d(256, 16, kernel_size=1), # Больше информации идет в голову
+            nn.Conv2d(256, 16, kernel_size=1), 
             nn.BatchNorm2d(16),
             nn.LeakyReLU(0.1),
             nn.Flatten(),
-            nn.Linear(16 * 8 * 8, 512), # <-- Увеличили скрытый слой в 2 раза
+            nn.Linear(16 * 8 * 8, 512), 
             nn.LeakyReLU(0.1),
             nn.Dropout(0.3),
-            nn.Linear(512, 1),
-            nn.Tanh() # Здесь Tanh оставляем для гарантии, что сеть не выдаст число > 1
+            nn.Linear(512, 100),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_conv(x)
         x = self.resnet_blocks(x)
+        x = self.transformer(x) # <-- ПРОПУСКАЕМ ЧЕРЕЗ ТРАНСФОРМЕР
         return self.value_head(x)
 
 PIECE_TO_CHANNEL = {
     'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
     'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
 }
+
+class FocusMSELoss(nn.Module):
+    def __init__(self, focus_strength=4.0):
+        super().__init__()
+        self.focus_strength = focus_strength
+        self.mse = nn.MSELoss(reduction='none') # Считаем ошибку для каждого элемента отдельно
+
+    def forward(self, predictions, targets):
+        # Базовая ошибка
+        base_loss = self.mse(predictions, targets)
+        
+        # Усилитель: Максимален при targets == 0.5 (равная игра), минимален по краям
+        # При focus_strength=4.0, ошибки в равных позициях штрафуются в 2 раза сильнее
+        weight = 1.0 + self.focus_strength * targets * (1.0 - targets)
+        
+        # Умножаем ошибку на вес и возвращаем среднее
+        return torch.mean(base_loss * weight)
 
 # *** Конвертация FEN в тензор и обучение ***
 
@@ -148,14 +165,14 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
     # Обучаем
     model = ChessResNet(num_blocks=10).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-    loss_fn = nn.HuberLoss()
+    loss_fn = nn.CrossEntropyLoss()
     epochs = 100
 
     patience = 5
     best_val_loss = float('inf')
     epochs_no_improve = 0
 
-    scaler = GradScaler(device)
+    scaler = GradScaler()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2
     )
@@ -174,7 +191,7 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
             # 2. Оборачиваем forward pass и расчет loss в autocast
             with torch.amp.autocast(device_str):
                 predictions = model(batch_inputs)
-                loss = loss_fn(predictions, batch_targets)
+                loss = loss_fn(predictions, batch_targets.long())
 
             # 3. Масштабируем градиенты для защиты от "исчезновения" 16-битных чисел
             scaler.scale(loss).backward()
@@ -200,7 +217,7 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
 
         avg_val_loss = val_loss / len(val_loader)
 
-        print(f"Эпоха {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"\tЭпоха {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
         scheduler.step(avg_val_loss)
 
@@ -245,8 +262,8 @@ def export_model_to_onnx():
     model.load_state_dict(torch.load("best_chess_model.pth", map_location=device))
     model.eval()
 
-    # Создаем фейковый тензор нужной формы (1 батч, 14 слоев, 8x8)
-    dummy_input = torch.randn(1, 14, 8, 8, device=device)
+    # Создаем фейковый тензор нужной формы (1 батч, 15 слоев, 8x8)
+    dummy_input = torch.randn(1, 15, 8, 8, device=device)
 
     # Экспортируем
     torch.onnx.export(
@@ -270,63 +287,64 @@ def predict_evaluation(model: nn.Module, fens: List[str]) -> List[float]:
     device = next(model.parameters()).device
     inputs = torch.stack([fen_to_tensor(fen) for fen in fens]).to(device)
 
+    # Массив значений для каждой корзины от -10 до +10
+    bucket_values = torch.linspace(-10.0, 10.0, steps=100, device=device)
+
     with torch.no_grad():
-        predictions = model(inputs).view(-1).tolist()
+        # Получаем сырые логиты
+        logits = model(inputs)
+        # Переводим логиты в реальные проценты вероятности (сумма = 1.0)
+        probabilities = torch.softmax(logits, dim=-1)
+        
+        # Математическое ожидание: Вероятность * Значение корзины
+        # Это даст идеальную дробную точность (например, 1.27 пешек)
+        expected_evals = torch.sum(probabilities * bucket_values, dim=-1).tolist()
 
-    # Разворачиваем tanh обратно в пешки
-    eval_in_pawns = []
-    for p in predictions:
-        # Защита от бесконечности (если сеть выдаст ровно 1.0 или -1.0)
-        p_clipped = max(-0.999, min(0.999, p))
-        eval_in_pawns.append(math.atanh(p_clipped) * 4.0)
+    return expected_evals
 
-    return eval_in_pawns
-
-def evaluate_model_metrics(model: torch.nn.Module, dataloader: torch.utils.data.DataLoader, device: torch.device):
-    """
-    Прогоняет датасет через модель и возвращает среднюю ошибку в пешках и точность определения лидера.
-    """
+def evaluate_model_metrics(model: torch.nn.Module, dataloader: torch.utils.data.DataLoader, device: torch.device) -> tuple[float, float]:
     model.eval()
     total_mae_pawns = 0.0
     correct_signs = 0
     total_positions = 0
 
+    # Создаем шкалу корзин от -10 до +10 пешек (100 классов)
+    bucket_values = torch.linspace(-10.0, 10.0, steps=100, device=device)
+
     with torch.no_grad():
         for batch_inputs, batch_targets in dataloader:
             batch_inputs = batch_inputs.to(device, non_blocking=True)
-            batch_targets = batch_targets.to(device, non_blocking=True)
+            batch_targets = batch_targets.to(device, non_blocking=True) # Форма: [2048]
 
-            # Получаем предсказания сети в сжатом виде [-1, 1]
-            preds = model(batch_inputs).view(-1)
-            targets = batch_targets.view(-1)
+            # 1. Получаем логиты от сети
+            logits = model(batch_inputs) # Форма: [2048, 100]
 
-            # Защита от бесконечности перед atanh
-            preds_clipped = torch.clamp(preds, min=-0.999, max=0.999)
-            targets_clipped = torch.clamp(targets, min=-0.999, max=0.999)
+            # 2. Переводим логиты в вероятности (Softmax)
+            probabilities = torch.softmax(logits, dim=-1)
 
-            # Денормализация: возвращаем значения обратно в пешки (Разворачиваем tanh)
-            preds_pawns = torch.atanh(preds_clipped) * 4.0
-            targets_pawns = torch.atanh(targets_clipped) * 4.0
+            # 3. Предсказания сети: Считаем матожидание (Вероятность * Значение корзины)
+            preds_pawns = torch.sum(probabilities * bucket_values, dim=-1) # Форма: [2048]
 
-            # 1. Считаем ошибку в пешках
+            # 4. Реальная оценка: Вытаскиваем значение пешек по индексу правильного класса
+            targets_pawns = bucket_values[batch_targets] # Форма: [2048]
+
+            # 5. Считаем ошибку (MAE)
             mae = torch.abs(preds_pawns - targets_pawns).sum().item()
             total_mae_pawns += mae
 
-            # 2. Считаем совпадение знаков (Угадали ли, кто побеждает)
-            # Если оба числа > 0 (белые) или оба < 0 (черные) или оба == 0
+            # 6. Точность угадывания лидера (сравниваем знаки)
             preds_signs = torch.sign(preds_pawns)
             targets_signs = torch.sign(targets_pawns)
             correct_signs += (preds_signs == targets_signs).sum().item()
 
-            total_positions += targets.size(0)
+            total_positions += batch_targets.size(0)
 
-    # Итоговые метрики
     avg_mae_pawns = total_mae_pawns / total_positions
     sign_accuracy = (correct_signs / total_positions) * 100.0
 
     print(f"\n📊 Результаты тестирования ({total_positions} позиций):")
-    print(f"Оценка лидера (Sign Accuracy): {sign_accuracy:.1f}%")
-    print(f"Средняя ошибка (MAE):          {avg_mae_pawns:.2f} пешек")
+    print(f"\tОценка лидера (Sign Accuracy): {sign_accuracy:.1f}%")
+    print(f"\tСредняя ошибка (MAE):          {avg_mae_pawns:.2f} пешек")
 
     return avg_mae_pawns, sign_accuracy
 
@@ -351,3 +369,10 @@ def show_model_stats(model, val_loader, df):
 
     # СТАТИСТИКА
     evaluate_model_metrics(model, val_loader, device)
+
+# Функция конвертации WDL -> Пешки для тензоров (работает на GPU)
+def tensor_wdl_to_pawns(wdl_tensor: torch.Tensor) -> torch.Tensor:
+    # Ограничиваем, чтобы не получить log10(0) или деление на ноль
+    safe_wdl = torch.clamp(wdl_tensor, min=0.001, max=0.999)
+    # Обратная формула WDL: eval = -4 * log10(1/WDL - 1)
+    return -4.0 * torch.log10((1.0 / safe_wdl) - 1.0)
