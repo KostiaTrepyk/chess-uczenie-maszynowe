@@ -2,15 +2,15 @@ from core.dataset import load_dataset, prepare_dataset
 from core.model import show_model_stats, train_model
 
 if __name__ == '__main__':
-    # Загрузка данных, обучение модели 
+    # Wczytywanie danych, trenowanie modelu 
     df = load_dataset(5_000_000)
 
     train_loader, val_loader = prepare_dataset(df)
 
     model = train_model(train_loader, val_loader)
 
-    # Оценка модели
-    print('\nОценка модели на валидационном наборе данных:')
+    # Ocena modelu
+    print('\nOcena modelu na walidacyjnym zbiorze danych:')
     df_test = load_dataset(100_000)
     _, val_loader_test = prepare_dataset(df_test)
 
