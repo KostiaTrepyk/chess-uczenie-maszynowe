@@ -1,30 +1,30 @@
 import torch
-import math
 import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from typing import List
+from tqdm import tqdm
+import torch.nn.functional as F
 
 class TransformerBlock(nn.Module):
     def __init__(self, channels: int, heads: int = 4):
         super().__init__()
-        # Внимание: 4 "головы" будут искать разные паттерны (связки, защиту короля и т.д.)
         self.attention = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, batch_first=True)
         self.norm = nn.LayerNorm(channels)
+        # Обучаемые позиционные эмбеддинги для 64 клеток доски
+        self.pos_embedding = nn.Parameter(torch.randn(1, 64, channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.size()
         
-        # Разворачиваем доску 8x8 в последовательность из 64 клеток для трансформера
-        x_flat = x.view(b, c, h * w).permute(0, 2, 1) # Форма: (Batch, 64, Channels)
+        x_flat = x.view(b, c, h * w).permute(0, 2, 1) # (Batch, 64, Channels)
         
-        # Сеть "смотрит" сама на себя, находя скрытые связи между клетками
+        # Добавляем позиционную информацию
+        x_flat = x_flat + self.pos_embedding
+        
         attn_out, _ = self.attention(x_flat, x_flat, x_flat)
-        
-        # Добавляем исходные данные и нормализуем (Residual connection)
         out = self.norm(x_flat + attn_out)
         
-        # Сворачиваем обратно в классическую форму доски
         return out.permute(0, 2, 1).view(b, c, h, w)
     
 class ResidualBlock(nn.Module):
@@ -114,6 +114,35 @@ class FocusMSELoss(nn.Module):
 
 # *** Конвертация FEN в тензор и обучение ***
 
+def build_batch_on_gpu(boards, turns, castling, ep):
+    """Мгновенно собирает батч [Batch, 15, 8, 8] прямо на видеокарте"""
+    b = boards.size(0)
+    device = boards.device
+    
+    # 1. Фигуры (12 слоев) через one_hot 
+    pieces = F.one_hot(boards, num_classes=13)[:, :, :12].float()
+    pieces = pieces.permute(0, 2, 1).view(b, 12, 8, 8)
+    
+    # 2. Очередь хода (1 слой) размножаем на всю доску
+    turns_layer = turns.view(b, 1, 1, 1).expand(b, 1, 8, 8)
+    
+    # 3. Рокировка (1 слой)
+    castling_layer = torch.zeros((b, 1, 8, 8), device=device, dtype=torch.float32)
+    castling_layer[:, 0, 7, 7] = castling[:, 0]
+    castling_layer[:, 0, 7, 0] = castling[:, 1]
+    castling_layer[:, 0, 0, 7] = castling[:, 2]
+    castling_layer[:, 0, 0, 0] = castling[:, 3]
+    
+    # 4. Взятие на проходе (1 слой)
+    ep_layer = torch.zeros((b, 1, 64), device=device, dtype=torch.float32)
+    has_ep = ep > 0
+    ep_idx = ep[has_ep] - 1
+    ep_layer[has_ep, 0, ep_idx] = 1.0 # Вставляем единицы только там, где есть En Passant
+    ep_layer = ep_layer.view(b, 1, 8, 8)
+    
+    # Склеиваем 12 + 1 + 1 + 1 = 15 слоев
+    return torch.cat([pieces, turns_layer, castling_layer, ep_layer], dim=1)
+
 def fen_to_tensor(fen: str) -> torch.Tensor:
     parts = fen.split()
     board_part = parts[0]
@@ -162,9 +191,15 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nОбучение на устройстве: {device}")
 
-    # Обучаем
+    # Включаем аппаратное ускорение для сверточных сетей (Дает +10-15% скорости)
+    torch.backends.cudnn.benchmark = True
+
     model = ChessResNet(num_blocks=10).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    
+    # Компиляция модели для PyTorch 2.0+ (Дает еще +20% скорости). Если выдаст ошибку на Windows - просто удали эту строку.
+    # model = torch.compile(model) 
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
     loss_fn = nn.CrossEntropyLoss()
     epochs = 100
 
@@ -182,41 +217,48 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
         model.train()
         train_loss = 0.0
 
-        for batch_inputs, batch_targets in train_loader:
-            batch_inputs = batch_inputs.to(device, non_blocking=True)
-            batch_targets = batch_targets.to(device, non_blocking=True)
+        train_pbar = tqdm(train_loader, desc=f"Эпоха {epoch+1}/{epochs} [Train]", leave=False)
+        for batch_data in train_pbar:
+            # 1. Переносим сырые легкие данные на видеокарту
+            boards, turns, castling, eps, batch_targets = [x.to(device, non_blocking=True) for x in batch_data]
+            
+            # 2. Мгновенно собираем тяжелые матрицы на GPU
+            batch_inputs = build_batch_on_gpu(boards, turns, castling, eps)
 
-            optimizer.zero_grad(set_to_none=True) # set_to_none=True работает быстрее обычного zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            # 2. Оборачиваем forward pass и расчет loss в autocast
             with torch.amp.autocast(device_str):
                 predictions = model(batch_inputs)
-                loss = loss_fn(predictions, batch_targets.long())
+                loss = loss_fn(predictions, batch_targets) # .long() уже сделан в Dataset
 
-            # 3. Масштабируем градиенты для защиты от "исчезновения" 16-битных чисел
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             train_loss += loss.item()
+            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
         avg_train_loss = train_loss / len(train_loader)
 
         model.eval()
         val_loss = 0.0
 
+        val_pbar = tqdm(val_loader, desc=f"Эпоха {epoch+1}/{epochs} [Val]", leave=False)
         with torch.no_grad():
-            for val_inputs, val_targets in val_loader:
-                # ПЕРЕНОСИМ ВАЛИДАЦИОННЫЕ БАТЧИ НА GPU
-                val_inputs = val_inputs.to(device, non_blocking=True)
-                val_targets = val_targets.to(device, non_blocking=True)
+            for val_data in val_pbar:
+                # То же самое для валидации: переносим и собираем
+                boards, turns, castling, eps, val_targets = [x.to(device, non_blocking=True) for x in val_data]
+                val_inputs = build_batch_on_gpu(boards, turns, castling, eps)
 
                 val_preds = model(val_inputs)
                 v_loss = loss_fn(val_preds, val_targets)
                 val_loss += v_loss.item()
+                
+                val_pbar.set_postfix({'loss': f"{v_loss.item():.4f}"})
 
         avg_val_loss = val_loss / len(val_loader)
 
+        # Оставляем только финальный вывод, полоски исчезнут (leave=False)
         print(f"\tЭпоха {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
         scheduler.step(avg_val_loss)
@@ -307,32 +349,28 @@ def evaluate_model_metrics(model: torch.nn.Module, dataloader: torch.utils.data.
     total_mae_pawns = 0.0
     correct_signs = 0
     total_positions = 0
-
-    # Создаем шкалу корзин от -10 до +10 пешек (100 классов)
     bucket_values = torch.linspace(-10.0, 10.0, steps=100, device=device)
 
     with torch.no_grad():
-        for batch_inputs, batch_targets in dataloader:
-            batch_inputs = batch_inputs.to(device, non_blocking=True)
-            batch_targets = batch_targets.to(device, non_blocking=True) # Форма: [2048]
+        # === ИЗМЕНЕНИЯ ЗДЕСЬ ===
+        for val_data in dataloader:
+            # 1. Распаковываем 5 элементов
+            boards, turns, castling, eps, batch_targets = [x.to(device, non_blocking=True) for x in val_data]
+            
+            # 2. Собираем батч на GPU
+            batch_inputs = build_batch_on_gpu(boards, turns, castling, eps)
 
-            # 1. Получаем логиты от сети
-            logits = model(batch_inputs) # Форма: [2048, 100]
+            # 3. Передаем в модель
+            logits = model(batch_inputs) 
+        # =======================
 
-            # 2. Переводим логиты в вероятности (Softmax)
             probabilities = torch.softmax(logits, dim=-1)
+            preds_pawns = torch.sum(probabilities * bucket_values, dim=-1) 
+            targets_pawns = bucket_values[batch_targets] 
 
-            # 3. Предсказания сети: Считаем матожидание (Вероятность * Значение корзины)
-            preds_pawns = torch.sum(probabilities * bucket_values, dim=-1) # Форма: [2048]
-
-            # 4. Реальная оценка: Вытаскиваем значение пешек по индексу правильного класса
-            targets_pawns = bucket_values[batch_targets] # Форма: [2048]
-
-            # 5. Считаем ошибку (MAE)
             mae = torch.abs(preds_pawns - targets_pawns).sum().item()
             total_mae_pawns += mae
 
-            # 6. Точность угадывания лидера (сравниваем знаки)
             preds_signs = torch.sign(preds_pawns)
             targets_signs = torch.sign(targets_pawns)
             correct_signs += (preds_signs == targets_signs).sum().item()

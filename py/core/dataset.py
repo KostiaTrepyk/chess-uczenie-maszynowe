@@ -90,31 +90,16 @@ class FastChessDataset(Dataset):
     def __len__(self) -> int: 
         return len(self.boards)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        board_idx = torch.tensor(self.boards[idx], dtype=torch.long)
-        board_layers = F.one_hot(board_idx, num_classes=13)[:, :12].float()
-        board_layers = board_layers.view(8, 8, 12).permute(2, 0, 1)
-
-        tensor = torch.zeros((15, 8, 8), dtype=torch.float32)
-        tensor[:12, :, :] = board_layers
+    def __getitem__(self, idx: int) -> tuple:
+        # Максимально быстрый сброс сырых данных
+        board = torch.tensor(self.boards[idx], dtype=torch.long)
+        turn = torch.tensor(self.turns[idx], dtype=torch.float32)
+        castling = torch.tensor(self.castling[idx], dtype=torch.float32)
+        ep = torch.tensor(self.ep[idx], dtype=torch.long)
         
-        if self.turns[idx] == 1: tensor[12, :, :] = 1.0
-        
-        c = self.castling[idx]
-        if c[0]: tensor[13, 7, 7] = 1.0
-        if c[1]: tensor[13, 7, 0] = 1.0
-        if c[2]: tensor[13, 0, 7] = 1.0
-        if c[3]: tensor[13, 0, 0] = 1.0
-
-        ep_val = self.ep[idx]
-        if ep_val > 0:
-            ep_idx = ep_val - 1
-            ep_row = ep_idx // 8
-            ep_col = ep_idx % 8
-            tensor[14, ep_row, ep_col] = 1.0
-            
         target_class = int(self.targets[idx]) 
-        return tensor, torch.tensor(target_class, dtype=torch.long)
+        
+        return board, turn, castling, ep, torch.tensor(target_class, dtype=torch.long)
 
 def prepare_dataset(df: DataFrame) -> tuple[DataLoader, DataLoader]:
     print('\nПодготовка датасета...')
@@ -129,20 +114,20 @@ def prepare_dataset(df: DataFrame) -> tuple[DataLoader, DataLoader]:
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=2048,
+        batch_size=1024,
         shuffle=True,
-        num_workers=10,
+        num_workers=0,
         pin_memory=is_cuda,
-        persistent_workers=True if is_cuda else False
+        persistent_workers=False
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=2048,
+        batch_size=1024,
         shuffle=False,
-        num_workers=10,
+        num_workers=0,
         pin_memory=is_cuda,
-        persistent_workers=True if is_cuda else False
+        persistent_workers=False
     )
     
     print('Подготовка датасета завершена.')
