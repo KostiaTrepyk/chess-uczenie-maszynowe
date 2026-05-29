@@ -95,23 +95,6 @@ PIECE_TO_CHANNEL = {
     'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
 }
 
-class FocusMSELoss(nn.Module):
-    def __init__(self, focus_strength=4.0):
-        super().__init__()
-        self.focus_strength = focus_strength
-        self.mse = nn.MSELoss(reduction='none') # Считаем ошибку для каждого элемента отдельно
-
-    def forward(self, predictions, targets):
-        # Базовая ошибка
-        base_loss = self.mse(predictions, targets)
-        
-        # Усилитель: Максимален при targets == 0.5 (равная игра), минимален по краям
-        # При focus_strength=4.0, ошибки в равных позициях штрафуются в 2 раза сильнее
-        weight = 1.0 + self.focus_strength * targets * (1.0 - targets)
-        
-        # Умножаем ошибку на вес и возвращаем среднее
-        return torch.mean(base_loss * weight)
-
 # *** Конвертация FEN в тензор и обучение ***
 
 def build_batch_on_gpu(boards, turns, castling, ep):
@@ -228,8 +211,9 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_str):
+                # PyTorch автоматически применит FlashAttention внутри Трансформера
                 predictions = model(batch_inputs)
-                loss = loss_fn(predictions, batch_targets) # .long() уже сделан в Dataset
+                loss = loss_fn(predictions, batch_targets)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -407,10 +391,3 @@ def show_model_stats(model, val_loader, df):
 
     # СТАТИСТИКА
     evaluate_model_metrics(model, val_loader, device)
-
-# Функция конвертации WDL -> Пешки для тензоров (работает на GPU)
-def tensor_wdl_to_pawns(wdl_tensor: torch.Tensor) -> torch.Tensor:
-    # Ограничиваем, чтобы не получить log10(0) или деление на ноль
-    safe_wdl = torch.clamp(wdl_tensor, min=0.001, max=0.999)
-    # Обратная формула WDL: eval = -4 * log10(1/WDL - 1)
-    return -4.0 * torch.log10((1.0 / safe_wdl) - 1.0)

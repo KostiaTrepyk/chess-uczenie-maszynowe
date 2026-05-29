@@ -3,7 +3,7 @@ from core.model import show_model_stats, train_model
 
 if __name__ == '__main__':
     # Загрузка данных, обучение модели 
-    df = load_dataset()
+    df = load_dataset(5_000_000)
 
     train_loader, val_loader = prepare_dataset(df)
 
