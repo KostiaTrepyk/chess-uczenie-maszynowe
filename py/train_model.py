@@ -1,5 +1,6 @@
 from core.dataset import load_dataset, prepare_dataset
-from core.model import show_model_stats, train_model
+from core.trainer import train_model
+from core.metrics import show_model_stats
 
 if __name__ == '__main__':
     # Wczytywanie danych, trenowanie modelu 

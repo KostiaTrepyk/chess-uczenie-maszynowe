@@ -1,0 +1,24 @@
+import torch
+
+from core.architecture import ChessResNet
+
+def export_model_to_onnx():
+    device = torch.device('cpu')
+    model = ChessResNet(num_blocks=10).to(device)
+    model.load_state_dict(torch.load("best_chess_model.pth", map_location=device))
+    model.eval()
+
+    # Tworzymy fałszywy tensor o odpowiednim kształcie (1 batch, 15 warstw, 8x8)
+    dummy_input = torch.randn(1, 15, 8, 8, device=device)
+
+    # Eksportujemy
+    torch.onnx.export(
+        model,
+        dummy_input,
+        "chess_model.onnx",
+        export_params=True,
+        opset_version=18,
+        input_names=['input'],
+        output_names=['output']
+    )
+    print("✅ Plik chess_model.onnx jest gotowy!")
