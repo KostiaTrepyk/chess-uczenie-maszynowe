@@ -387,7 +387,7 @@ def show_model_stats(model, val_loader, df):
     print("\nWyniki oceny przez sieć neuronową:")
     for [fen, correct_eval], eval_score in zip(test_positions, evaluations):
         print(f"\nPozycja: {fen.split()[0]}")
-        print(f"Ocena sieci: {eval_score:.2f} piona (lub {int(eval_score * 100)} сантиpiona) | Prawdziwa: {correct_eval}")
+        print(f"Ocena sieci: {eval_score:.2f} piona (lub {int(eval_score * 100)} centypionach) | Prawdziwa: {correct_eval}")
 
     # STATYSTYKA
     evaluate_model_metrics(model, val_loader, device)
