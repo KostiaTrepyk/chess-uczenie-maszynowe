@@ -74,8 +74,17 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
                 val_loss = 0.0
 
                 val_pbar = tqdm(val_loader, desc=f"Epoka {epoch+1} [Val] Krok {step+1}", leave=False)
+                
+                # Ограничиваем валидацию (например, 400 батчей это ~100k позиций)
+                # Этого более чем достаточно для точной статистики
+                max_val_batches = 400 
+                val_steps_taken = 0
+                
                 with torch.no_grad():
                     for val_data in val_pbar:
+                        if val_steps_taken >= max_val_batches:
+                            break # Прерываем валидацию досрочно
+                            
                         boards, turns, castling, eps, val_targets = [x.to(device, non_blocking=True) for x in val_data]
                         val_inputs = build_batch_on_gpu(boards, turns, castling, eps)
 
@@ -83,9 +92,11 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
                         v_loss = loss_fn(val_preds, val_targets)
                         val_loss += v_loss.item()
                         
+                        val_steps_taken += 1
                         val_pbar.set_postfix({'loss': f"{v_loss.item():.4f}"})
 
-                avg_val_loss = val_loss / len(val_loader)
+                # Важно: делим на количество реально пройденных шагов, а не на len(val_loader)
+                avg_val_loss = val_loss / val_steps_taken
 
                 print(f"\n\t[Epoka {epoch+1} | Krok {step+1}/{total_batches}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
