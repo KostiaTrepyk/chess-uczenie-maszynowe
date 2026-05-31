@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 from typing import List
 
 from core.features import fen_to_tensor, build_batch_on_gpu
@@ -34,8 +35,11 @@ def evaluate_model_metrics(model: torch.nn.Module, dataloader: torch.utils.data.
     total_positions = 0
     bucket_values = torch.linspace(-10.0, 10.0, steps=100, device=device)
 
+    # Оборачиваем dataloader в tqdm
+    eval_pbar = tqdm(dataloader, desc="Testowanie modelu", leave=True)
+
     with torch.no_grad():
-        for val_data in dataloader:
+        for val_data in eval_pbar:
             boards, turns, castling, eps, batch_targets = [x.to(device, non_blocking=True) for x in val_data]
             
             # Budujemy batch na GPU
@@ -56,6 +60,11 @@ def evaluate_model_metrics(model: torch.nn.Module, dataloader: torch.utils.data.
             correct_signs += (preds_signs == targets_signs).sum().item()
 
             total_positions += batch_targets.size(0)
+
+            # Вычисляем текущие метрики на лету и выводим их в прогресс-бар
+            running_mae = total_mae_pawns / total_positions
+            running_acc = (correct_signs / total_positions) * 100.0
+            eval_pbar.set_postfix({'MAE': f"{running_mae:.2f}", 'Acc': f"{running_acc:.1f}%"})
 
     avg_mae_pawns = total_mae_pawns / total_positions
     sign_accuracy = (correct_signs / total_positions) * 100.0

@@ -44,52 +44,40 @@ class TransformerBlock(nn.Module):
         return out.permute(0, 2, 1).view(b, c, h, w)
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        # Pierwsza warstwa splotowa (konwolucyjna) - szuka lokalnych wzorców na planszy (np. obrona bierek)
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        # Normalizacja warstwy (Batch Normalization) - stabilizuje i znacznie przyspiesza proces uczenia
+    def __init__(self, channels: int = 256):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
         
-        # Druga warstwa splotowa - buduje bardziej złożone cechy na podstawie wyników pierwszej warstwy
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Возвращаем твой LeakyReLU
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.1, inplace=True) 
+        
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
         
-        # Funkcja aktywacji LeakyReLU - zapobiega problemowi "umierających neuronów" (przepuszcza mały gradient dla wartości < 0)
-        self.leaky_relu = nn.LeakyReLU(0.1)
-
-        # Blok Squeeze-and-Excitation (SE) - mechanizm uwagi (attention) dla kanałów.
-        # Pozwala sieci "zrozumieć", które mapy cech są w danym momencie najważniejsze.
-        self.se = nn.Sequential(
-            # Squeeze (Ściskanie): globalna kompresja przestrzenna z 8x8 na 1x1. Tworzy ogólne podsumowanie dla każdego kanału.
-            nn.AdaptiveAvgPool2d(1), 
-            # Excitation (Wzbudzanie) krok 1: redukcja wymiarowości kanałów w celu zmniejszenia kosztów obliczeniowych
-            nn.Conv2d(channels, channels // reduction, kernel_size=1),
-            nn.LeakyReLU(0.1),
-            # Excitation krok 2: przywrócenie oryginalnej liczby kanałów
-            nn.Conv2d(channels // reduction, channels, kernel_size=1),
-            # Funkcja Sigmoid skaluje wartości do przedziału [0, 1] - działa jak bramka wyliczająca wagę (znaczenie) każdego kanału
-            nn.Sigmoid()
-        )
+        # Наш новый умный эквалайзер каналов
+        self.se = SEBlock(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Zapisujemy oryginalne wejście (tzw. skip connection / połączenie rezydualne)
         residual = x
-
-        # Główne przejście sygnału przez konwolucje
-        out = self.leaky_relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
         
-        # Zastosowanie mechanizmu uwagi
-        # Przemnażamy uzyskane cechy przez wyliczone wagi (od 0 do 1) z bloku SE
-        out = out * self.se(out)
-
-        # Kluczowy element ResNet: dodajemy oryginalne, nieprzetworzone wejście do wyniku.
-        # Zapobiega to degradacji dokładności i znikaniu gradientu w bardzo głębokich sieciach.
+        # Первая свертка + BatchNorm + Активация
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.leaky_relu(out)
+        
+        # Вторая свертка + BatchNorm
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        # Применяем SEBlock ДО сложения с residual
+        out = self.se(out)
+        
+        # Складываем и применяем финальную активацию
         out += residual
+        out = self.leaky_relu(out)
         
-        # Ostateczna aktywacja warstwy
-        return self.leaky_relu(out)
+        return out
 
 class ChessResNet(nn.Module):
     def __init__(self, num_blocks=num_blocks, channels=channels):
@@ -172,3 +160,25 @@ def load_model(num_blocks=num_blocks, channels=channels)-> ChessResNet:
     model.eval()
 
     return model
+
+class SEBlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super(SEBlock, self).__init__()
+        # Сжимаем пространственную инфу до 1x1
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        
+        # Используем свертки 1x1 вместо Linear (это гораздо надежнее в PyTorch)
+        self.excitation = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x имеет форму [Batch, Channels, 8, 8]
+        y = self.squeeze(x)        # -> [Batch, Channels, 1, 1]
+        y = self.excitation(y)     # -> [Batch, Channels, 1, 1]
+        
+        # PyTorch сам автоматически "растянет" 1x1 до 8x8 при умножении (Broadcasting)
+        return x * y

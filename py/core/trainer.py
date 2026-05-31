@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from core.architecture import ChessResNet
 from core.features import build_batch_on_gpu
-from core.consts import checks_per_epoch
+from core.consts import checks_per_epoch, max_val_batches
 
 def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResNet:
     device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -18,22 +18,30 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
     model = ChessResNet().to(device)
     # model = torch.compile(model) # Zostawione zakomentowane ze względu na Windowsa
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
-    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
     epochs = 100
 
-    # Dostosowanie cierpliwości (patience), ponieważ sprawdzamy 4 razy częściej
     patience = 5 * checks_per_epoch  
     best_val_loss = float('inf')
     epochs_no_improve = 0
 
-    scaler = torch.GradScaler()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=(2 * checks_per_epoch)
-    )
-
+    # 1. СНАЧАЛА считаем батчи
     total_batches = len(train_loader)
     val_interval = max(1, total_batches // checks_per_epoch)
+
+    scaler = torch.GradScaler()
+    
+    # 2. ПОТОМ передаем их в OneCycleLR
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=0.001,
+        epochs=epochs,
+        steps_per_epoch=total_batches,
+        pct_start=0.1,
+        div_factor=10.0,
+        final_div_factor=1000.0
+    )
 
     print("\nRozpoczynamy trenowanie...")
     print(f"Całkowita liczba wsadów (batches) na epokę: {total_batches}")
@@ -61,10 +69,15 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
+            
+            scheduler.step()
+            
             running_train_loss += loss.item()
             steps_since_val += 1
-            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            
+            # Объединенный вывод метрик в tqdm (без затирания)
+            current_lr = scheduler.get_last_lr()[0]
+            train_pbar.set_postfix({'loss': f"{loss.item():.4f}", 'lr': f"{current_lr:.6f}"})
 
             # --- WALIDACJA WEWNĄTRZ EPOKI ---
             if (step + 1) % val_interval == 0 or (step + 1) == total_batches:
@@ -75,15 +88,12 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
 
                 val_pbar = tqdm(val_loader, desc=f"Epoka {epoch+1} [Val] Krok {step+1}", leave=False)
                 
-                # Ограничиваем валидацию (например, 400 батчей это ~100k позиций)
-                # Этого более чем достаточно для точной статистики
-                max_val_batches = 400 
                 val_steps_taken = 0
                 
                 with torch.no_grad():
                     for val_data in val_pbar:
                         if val_steps_taken >= max_val_batches:
-                            break # Прерываем валидацию досрочно
+                            break 
                             
                         boards, turns, castling, eps, val_targets = [x.to(device, non_blocking=True) for x in val_data]
                         val_inputs = build_batch_on_gpu(boards, turns, castling, eps)
@@ -95,12 +105,9 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
                         val_steps_taken += 1
                         val_pbar.set_postfix({'loss': f"{v_loss.item():.4f}"})
 
-                # Важно: делим на количество реально пройденных шагов, а не на len(val_loader)
                 avg_val_loss = val_loss / val_steps_taken
 
                 print(f"\n\t[Epoka {epoch+1} | Krok {step+1}/{total_batches}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-
-                scheduler.step(avg_val_loss)
 
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss

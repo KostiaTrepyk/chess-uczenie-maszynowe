@@ -3,8 +3,9 @@ channels = 256
 
 # 256 512
 batch_size = 256
-checks_per_epoch = 4
+checks_per_epoch = 12
+max_val_batches = 200
 
 # padding 3 dla kernel_size=7, 2 dla kernel_size=5, 1 dla kernel_size=3
-kernel_size = 3
-padding = 1
+kernel_size = 7
+padding = 3

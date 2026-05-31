@@ -7,7 +7,7 @@ from core.metrics import evaluate_model_metrics
 
 if __name__ == '__main__':
     # Wczytywanie danych, trenowanie modelu 
-    df = load_dataset()
+    df = load_dataset(1_000_000)
 
     train_loader, val_loader = prepare_dataset_with_split(df)
 
