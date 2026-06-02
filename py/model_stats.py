@@ -1,14 +1,11 @@
-import torch
-
-from core.dataset import prepare_dataset, load_dataset
+from core.dataset import load_dataset, prepare_dataset_with_split
 from core.architecture import load_model
 from core.metrics import evaluate_model_metrics, show_model_stats
 
 if __name__ == '__main__':
     model = load_model()
 
-    df = load_dataset(10_000)
-    loader = prepare_dataset(df)
+    df = load_dataset()
+    _, val_loader = prepare_dataset_with_split(df)
 
-    show_model_stats(model, loader, df)
-    # evaluate_model_metrics(model, loader, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    show_model_stats(model, val_loader, df)

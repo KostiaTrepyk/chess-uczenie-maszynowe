@@ -3,62 +3,123 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from core.metrics import prob_to_pawns
 from core.architecture import ChessResNet
 from core.features import build_batch_on_gpu
-from core.consts import checks_per_epoch, max_val_batches
+from core.consts import CHECKS_PER_EPOCH, MAX_VALIDATION_BATCHES, EPOCHS, START_LR, RESUME_START_LR
 
-def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResNet:
+def train_model(train_loader: DataLoader, val_loader: DataLoader, resume_path: str = None) -> ChessResNet:
     device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(device_str)
     print(f"\nTrenowanie na urządzeniu: {device}")
 
-    # Włączamy akcelerację sprzętową dla sieci splotowych
     torch.backends.cudnn.benchmark = True
-
     model = ChessResNet().to(device)
-    # model = torch.compile(model) # Zostawione zakomentowane ze względu na Windowsa
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
-    epochs = 100
-
-    patience = 5 * checks_per_epoch  
+    loss_fn = nn.BCEWithLogitsLoss()
     best_val_loss = float('inf')
-    epochs_no_improve = 0
+    start_lr = START_LR
+    start_epoch = 0
 
-    # 1. СНАЧАЛА считаем батчи
+    # Инициализируем optimizer и базовый scheduler перед загрузкой весов
+    optimizer = torch.optim.AdamW(model.parameters(), lr=start_lr, weight_decay=1e-4)
     total_batches = len(train_loader)
-    val_interval = max(1, total_batches // checks_per_epoch)
-
-    scaler = torch.GradScaler()
     
-    # 2. ПОТОМ передаем их в OneCycleLR
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=0.001,
-        epochs=epochs,
+        max_lr=start_lr,
         steps_per_epoch=total_batches,
+        epochs=EPOCHS,
         pct_start=0.1,
-        div_factor=10.0,
-        final_div_factor=1000.0
+        div_factor=10.0
     )
+
+    # 1. ЛОГИКА ДООБУЧЕНИЯ (FINE-TUNING / WZNOWIENIE)
+    if resume_path:
+        print(f"Wczytywanie z {resume_path}...")
+        try:
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        except Exception:
+            checkpoint = torch.load(resume_path, map_location=device)
+        
+        # Проверяем, полный ли это чекпоинт или только веса
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            print("Znaleziono pełny checkpoint! Wznawiam trening dokładnie od miejsca przerwania.")
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        else:
+            print("Znaleziono tylko wagi. Rozpoczynam delikatne douczanie (Fine-Tuning) z CosineAnnealingLR.")
+            model.load_state_dict(checkpoint)
+            
+            # Принудительно ставим малый LR для оптимайзера
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = RESUME_START_LR
+            
+            # Используем мягкий планировщик без агрессивного разгона
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_batches * EPOCHS,
+                eta_min=1e-6
+            )
+
+        print("Ocena początkowego modelu (Baseline Validation)...")
+        model.eval()
+        val_loss = 0.0
+        val_mae = 0.0  
+        val_steps_taken = 0
+        total_baseline_pos = 0
+        
+        with torch.no_grad():
+            for val_data in tqdm(val_loader, desc="Baseline Eval", leave=False):
+                if val_steps_taken >= MAX_VALIDATION_BATCHES: break 
+                boards, turns, castling, eps, val_targets = [x.to(device, non_blocking=True) for x in val_data]
+                val_inputs = build_batch_on_gpu(boards, turns, castling, eps)
+                
+                val_targets = torch.where(turns == 0, 1.0 - val_targets, val_targets)
+        
+                val_preds = model(val_inputs)
+                
+                v_loss = loss_fn(val_preds, val_targets)
+                val_loss += v_loss.item()
+                
+                preds_pawns = prob_to_pawns(torch.sigmoid(val_preds))
+                targets_pawns = prob_to_pawns(val_targets)
+                
+                val_mae += torch.abs(preds_pawns - targets_pawns).sum().item()
+                total_baseline_pos += val_targets.size(0)
+                
+                val_steps_taken += 1
+        
+        # Перезаписываем best_val_loss, чтобы старт был от свежей валидации
+        best_val_loss = val_loss / val_steps_taken
+        best_val_mae = val_mae / total_baseline_pos
+        
+        print(f">>> Baseline Val Loss: {best_val_loss:.4f} | Val MAE: {best_val_mae:.2f}\n")
+
+    patience = 5 * CHECKS_PER_EPOCH
+    epochs_no_improve = 0
+    val_interval = max(1, total_batches // CHECKS_PER_EPOCH)
+    scaler = torch.GradScaler()
 
     print("\nRozpoczynamy trenowanie...")
     print(f"Całkowita liczba wsadów (batches) na epokę: {total_batches}")
     print(f"Walidacja i zapis co {val_interval} wsadów.")
 
-    for epoch in range(epochs):
+    # Начинаем цикл с нужной эпохи (важно для возобновления прерванных сессий)
+    for epoch in range(start_epoch, EPOCHS):
         model.train()
         running_train_loss = 0.0
         steps_since_val = 0
 
-        train_pbar = tqdm(train_loader, desc=f"Epoka {epoch+1}/{epochs} [Train]", leave=False)
+        train_pbar = tqdm(train_loader, desc=f"Epoka {epoch+1}/{EPOCHS} [Train]", leave=False)
         for step, batch_data in enumerate(train_pbar):
-            # 1. Przenosimy dane na GPU
             boards, turns, castling, eps, batch_targets = [x.to(device, non_blocking=True) for x in batch_data]
-            
-            # 2. Budujemy macierze
             batch_inputs = build_batch_on_gpu(boards, turns, castling, eps)
+            
+            batch_targets = torch.where(turns == 0, 1.0 - batch_targets, batch_targets)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -67,53 +128,75 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
                 loss = loss_fn(predictions, batch_targets)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             scaler.step(optimizer)
             scaler.update()
             
             scheduler.step()
-            
+
             running_train_loss += loss.item()
             steps_since_val += 1
-            
-            # Объединенный вывод метрик в tqdm (без затирания)
-            current_lr = scheduler.get_last_lr()[0]
+
+            current_lr = optimizer.param_groups[0]['lr']
             train_pbar.set_postfix({'loss': f"{loss.item():.4f}", 'lr': f"{current_lr:.6f}"})
 
-            # --- WALIDACJA WEWNĄTRZ EPOKI ---
             if (step + 1) % val_interval == 0 or (step + 1) == total_batches:
                 avg_train_loss = running_train_loss / steps_since_val
                 
                 model.eval()
                 val_loss = 0.0
-
-                val_pbar = tqdm(val_loader, desc=f"Epoka {epoch+1} [Val] Krok {step+1}", leave=False)
+                total_val_mae = 0.0      
+                total_val_pos = 0        
                 
+                val_pbar = tqdm(val_loader, desc=f"Epoka {epoch+1} [Val] Krok {step+1}", leave=False)
                 val_steps_taken = 0
                 
                 with torch.no_grad():
                     for val_data in val_pbar:
-                        if val_steps_taken >= max_val_batches:
-                            break 
-                            
+                        if val_steps_taken >= MAX_VALIDATION_BATCHES: break 
                         boards, turns, castling, eps, val_targets = [x.to(device, non_blocking=True) for x in val_data]
                         val_inputs = build_batch_on_gpu(boards, turns, castling, eps)
+                        
+                        val_targets = torch.where(turns == 0, 1.0 - val_targets, val_targets)
 
                         val_preds = model(val_inputs)
+                        
                         v_loss = loss_fn(val_preds, val_targets)
                         val_loss += v_loss.item()
+                        
+                        preds_pawns = prob_to_pawns(torch.sigmoid(val_preds))
+                        targets_pawns = prob_to_pawns(val_targets)
+                        
+                        total_val_mae += torch.abs(preds_pawns - targets_pawns).sum().item()
+                        total_val_pos += val_targets.size(0)
                         
                         val_steps_taken += 1
                         val_pbar.set_postfix({'loss': f"{v_loss.item():.4f}"})
 
                 avg_val_loss = val_loss / val_steps_taken
+                avg_val_mae = total_val_mae / total_val_pos 
 
-                print(f"\n\t[Epoka {epoch+1} | Krok {step+1}/{total_batches}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+                print(f"\n\t[Epoka {epoch+1} | Krok {step+1}/{total_batches}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val MAE: {avg_val_mae:.2f}")
 
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     epochs_no_improve = 0
+                    
+                    # 1. Сохраняем чистые веса для боевой работы
                     torch.save(model.state_dict(), "best_chess_model.pth")
-                    print(f"\t>>> Zapisano nowy najlepszy model! (Loss: {best_val_loss:.4f})")
+                    
+                    # 2. Сохраняем полный стейт для идеального возобновления
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'best_val_loss': best_val_loss
+                    }, "checkpoint.pth")
+                    
+                    print(f"\t>>> Zapisano nowy najlepszy model! (Loss: {best_val_loss:.4f} | MAE: {avg_val_mae:.2f})")
                 else:
                     epochs_no_improve += 1
 
@@ -123,12 +206,10 @@ def train_model(train_loader : DataLoader, val_loader : DataLoader) -> ChessResN
                     model.eval()
                     return model
 
-                # Resetujemy statystyki i wracamy do treningu
                 running_train_loss = 0.0
                 steps_since_val = 0
-                model.train() 
+                model.train()
 
-    # Po zakończeniu wszystkich epok wczytujemy najlepszy model
     model.load_state_dict(torch.load("best_chess_model.pth"))
     model.eval()
     print("\nPomyślnie wczytano najlepszą wersję modelu.")

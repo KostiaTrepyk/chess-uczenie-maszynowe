@@ -1,9 +1,9 @@
 import torch
 
 from core.architecture import ChessResNet
-from core.consts import num_blocks, channels
+from core.consts import NUM_BLOCKS, CHANNELS
 
-def export_model_to_onnx(  num_blocks=num_blocks, channels=channels):
+def export_model_to_onnx(  num_blocks=NUM_BLOCKS, channels=CHANNELS):
     device = torch.device('cpu')
     model = ChessResNet(channels=channels, num_blocks=num_blocks).to(device)
     model.load_state_dict(torch.load("best_chess_model.pth", map_location=device))

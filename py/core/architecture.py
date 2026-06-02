@@ -1,46 +1,44 @@
 import torch
 import torch.nn as nn
 
-from core.consts import num_blocks, channels, kernel_size, padding
+from core.consts import NUM_BLOCKS, CHANNELS, KERNEL_SIZE, PADDING, TransformerBlockHeads
 
 class TransformerBlock(nn.Module):
-    def __init__(self, channels: int, heads: int = 4):
+    def __init__(self, channels: int, heads: int = 16):
         super().__init__()
         
-        # Mechanizm wielogłowej uwagi (Multi-head Attention). 
-        # batch_first=True oznacza oczekiwany format tensora: (Batch, Sequence, Features)
         self.attention = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels) # Вторая нормализация для MLP
         
-        # Normalizacja warstwy w celu stabilizacji gradientów podczas trenowania
-        self.norm = nn.LayerNorm(channels)
+        # Тот самый Feed-Forward (Мозг трансформера), которого не хватало
+        # Используем расширение x2 (вместо стандартного x4) для экономии скорости
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.GELU(), # GELU лучше работает в трансформерах, чем LeakyReLU
+            # nn.Dropout(0.0),
+            nn.Linear(channels * 2, channels)
+        )
         
-        # Trenowalne embeddingi pozycyjne dla 64 pól szachownicy.
-        # Sam mechanizm uwagi nie zna układu pól (nie ma pamięci przestrzennej), 
-        # dlatego dodajemy współrzędne (1 batch, 64 pola, wymiar kanałów).
-        self.pos_embedding = nn.Parameter(torch.randn(1, 64, channels))
+        self.pos_embedding = nn.Parameter(torch.randn(1, 64, channels) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Tensor wejściowy z CNN ma wymiary: (Batch, Channels, Height=8, Width=8)
         b, c, h, w = x.size()
-        
-        # Przygotowanie danych dla transformera:
-        # 1. Spłaszczamy planszę 2D (8x8) do sekwencji 1D o długości 64 (h * w)
-        # 2. permute: zmieniamy kolejność wymiarów, aby uzyskać format -> (Batch, 64, Channels)
         x_flat = x.view(b, c, h * w).permute(0, 2, 1)
         
-        # Dodajemy informację o pozycji do cech każdego pola
+        # 1. Позиционное кодирование
         x_flat = x_flat + self.pos_embedding
         
-        # Zastosowanie mechanizmu Self-Attention (Q, K, V są tym samym tensorem)
-        attn_out, _ = self.attention(x_flat, x_flat, x_flat)
+        # 2. Блок внимания (Attention)
+        norm_x1 = self.norm1(x_flat)
+        attn_out, _ = self.attention(norm_x1, norm_x1, norm_x1)
+        x_flat = x_flat + attn_out # Residual 1
         
-        # Połączenie rezydualne (dodanie wejścia do wyjścia) + Layer Normalization
-        out = self.norm(x_flat + attn_out)
+        # 3. Блок логики (Feed-Forward / MLP)
+        norm_x2 = self.norm2(x_flat)
+        mlp_out = self.mlp(norm_x2)
+        out = x_flat + mlp_out # Residual 2
         
-        # Przekształcenie odwrotne:
-        # 1. permute: przywracamy kanały na drugie miejsce -> (Batch, Channels, 64)
-        # 2. view: przywracamy 64 pola z powrotem do formatu 2D -> (Batch, Channels, 8, 8)
-        # Pozwala to na łatwą integrację bloku z pozostałymi warstwami splotowymi.
         return out.permute(0, 2, 1).view(b, c, h, w)
 
 class ResidualBlock(nn.Module):
@@ -49,102 +47,76 @@ class ResidualBlock(nn.Module):
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
         
-        # Возвращаем твой LeakyReLU
-        self.leaky_relu = nn.LeakyReLU(negative_slope=0.1, inplace=True) 
+        # Меняем на SiLU (Swish) для более гладкой оптимизации
+        self.act = nn.SiLU(inplace=True) 
         
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
         
-        # Наш новый умный эквалайзер каналов
         self.se = SEBlock(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         
-        # Первая свертка + BatchNorm + Активация
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.leaky_relu(out)
+        out = self.act(out)
         
-        # Вторая свертка + BatchNorm
         out = self.conv2(out)
         out = self.bn2(out)
-        
-        # Применяем SEBlock ДО сложения с residual
         out = self.se(out)
         
-        # Складываем и применяем финальную активацию
-        out += residual
-        out = self.leaky_relu(out)
+        # Строгая in-place операция: избегаем аллокации нового тензора в памяти
+        out.add_(residual)
+        out = self.act(out)
         
         return out
 
 class ChessResNet(nn.Module):
-    def __init__(self, num_blocks=num_blocks, channels=channels):
+    def __init__(self, num_blocks=NUM_BLOCKS, channels=CHANNELS):
         super().__init__()
         
-        # Blok wejściowy. 
-        # Zmienia początkową reprezentację planszy (15 warstw wejściowych: bierki, kolej ruchu, roszada, en passant) 
-        # na bogatszą reprezentację wielowymiarową (256 kanałów cech).
         self.input_conv = nn.Sequential(
-            nn.Conv2d(15, channels, kernel_size=kernel_size, padding=padding),
+            nn.Conv2d(15, channels, kernel_size=KERNEL_SIZE, padding=PADDING),
             nn.BatchNorm2d(channels),
             nn.LeakyReLU(0.1)
         )
 
-        # Główny rdzeń modelu (Backbone) oparty na architekturze ResNet.
-        # Składa się z serii bloków rezydualnych (domyślnie 10). 
-        # Służy do głębokiej ekstrakcji cech lokalnych (np. kontrola centrum, bezpieczeństwo króla).
         self.resnet_blocks = nn.Sequential(
             *[ResidualBlock(channels) for _ in range(num_blocks)]
         )
 
-        # <-- TUTAJ DODAJEMY TRANSFORMER -->
-        # Blok Transformera dodaje globalny kontekst (globalny "ogląd" sytuacji).
-        # Pozwala sieci natychmiast powiązać figury znajdujące się na przeciwległych końcach planszy.
-        self.transformer = TransformerBlock(channels=channels, heads=8)
+        self.transformer = nn.Sequential(
+            *[TransformerBlock(channels=channels, heads=TransformerBlockHeads) for _ in range(3)]
+        )
 
-        # Głowica oceniająca (Value Head). 
-        # Przekształca wyodrębnione cechy w ostateczną ocenę pozycji.
+        # Оптимизированная голова оценки (Value Head) в стиле AlphaZero
         self.value_head = nn.Sequential(
-            # Konwolucja 1x1 kompresuje liczbę kanałów z 256 na 32. 
-            # Drastycznie zmniejsza to liczbę parametrów przed warstwą w pełni połączoną (Linear), oszczędzając pamięć.
-            nn.Conv2d(channels, 32, kernel_size=1), 
-            nn.BatchNorm2d(32),
+            # Сжимаем 256 каналов всего до 4 (вместо 32). 
+            # Это сохраняет геометрию доски, но убирает огромный лишний вес.
+            nn.Conv2d(channels, 4, kernel_size=1), 
+            nn.BatchNorm2d(4),
             nn.LeakyReLU(0.1),
             
-            # Spłaszczanie danych z formatu 2D (kanały, wysokość, szerokość) do wektora 1D
             nn.Flatten(),
             
-            # Główna warstwa decyzyjna z 512 neuronami
-            nn.Linear(32 * 8 * 8, 1024), 
+            # Теперь размер вектора всего 4 * 8 * 8 = 256 (было 2048)
+            # Количество параметров здесь падает с 2 миллионов до 65 тысяч!
+            nn.Linear(256, 256),
             nn.LeakyReLU(0.1),
-            
-            # Zapobiega przeuczeniu (overfitting) poprzez losowe ignorowanie 30% neuronów podczas trenowania
-            nn.Dropout(0.3),
-            
-            # Wyjście sieci. 
-            # Sieć nie przewiduje jednej liczby, ale dokonuje klasyfikacji do jednego ze 100 "koszyków".
-            # Koszyki te reprezentują ocenę pozycji w zakresie od -10.0 do +10.0 pionów.
-            nn.Linear(1024, 100),
+            # nn.Dropout(0.0),
+
+            nn.Linear(256, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Przepływ sygnału (danych) przez kolejne etapy sieci:
-        
-        # 1. Wstępna obróbka z 15 na 256 kanałów
         x = self.input_conv(x)
-        
-        # 2. Głęboka analiza lokalnych struktur na planszy (konwolucje z uwagą SE)
         x = self.resnet_blocks(x)
+        x = self.transformer(x) 
         
-        # 3. Dodanie globalnego kontekstu przez Transformer
-        x = self.transformer(x) # <-- PRZEPUSZCZAMY PRZEZ TRANSFORMER
-        
-        # 4. Agregacja wyników i ostateczna predykcja (100 logitów dla każdego z koszyków)
-        return self.value_head(x)
+        return self.value_head(x).squeeze(-1)
 
-def load_model(num_blocks=num_blocks, channels=channels)-> ChessResNet:
+def load_model(num_blocks=NUM_BLOCKS, channels=CHANNELS)-> ChessResNet:
     # Wczytujemy gotowy model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
