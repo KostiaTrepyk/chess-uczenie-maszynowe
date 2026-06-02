@@ -1,6 +1,6 @@
 from core.dataset import load_dataset, prepare_dataset_with_split
 from core.architecture import load_model
-from core.metrics import evaluate_model_metrics, show_model_stats
+from core.metrics import show_model_stats
 
 if __name__ == '__main__':
     model = load_model()

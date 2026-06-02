@@ -24,12 +24,16 @@ def predict_evaluation(model: nn.Module, fens: List[str]) -> List[float]:
     inputs = torch.stack([fen_to_tensor(fen) for fen in fens]).to(device)
 
     with torch.no_grad():
-        probs = torch.sigmoid(model(inputs))
+        out = model(inputs)
+        # collapse extra output dims to a single scalar per sample (robust to different value_head shapes)
+        if out.ndim > 1:
+            out = out.view(out.size(0), -1).mean(dim=1)
+        probs = torch.sigmoid(out)
         expected_evals = prob_to_pawns(probs).tolist()
 
     # Инвертируем оценку обратно для интерфейса (если ход черных)
     for i, fen in enumerate(fens):
-        val = expected_evals[i][0] if isinstance(expected_evals[i], list) else expected_evals[i]
+        val = expected_evals[i]
         if ' b ' in fen:
             expected_evals[i] = -val
         else:
@@ -53,10 +57,18 @@ def evaluate_model_metrics(model: torch.nn.Module, dataloader: torch.utils.data.
 
             batch_targets_canonical = torch.where(turns == 0, 1.0 - batch_targets, batch_targets)
 
-            probs = torch.sigmoid(model(batch_inputs)) 
-            
+            out = model(batch_inputs)
+            if out.ndim > 1:
+                out = out.view(out.size(0), -1).mean(dim=1)
+
+            probs = torch.sigmoid(out)
+
             preds_pawns = prob_to_pawns(probs)
             targets_pawns = prob_to_pawns(batch_targets_canonical)
+
+            # ensure both are 1D tensors of shape (batch,)
+            preds_pawns = preds_pawns.view(-1)
+            targets_pawns = targets_pawns.view(-1)
 
             mae = torch.abs(preds_pawns - targets_pawns).sum().item()
             total_mae_pawns += mae
@@ -91,8 +103,10 @@ def show_model_stats(model, val_loader, df):
     evaluations = predict_evaluation(model, just_fens)
 
     # Списки для подсчета средней ошибки по диапазонам
-    center_diffs = []
-    extreme_diffs = []
+    # Бины: symmetric ranges specified by user: 1,2,3,5,7,10
+    bins = [0, 1, 2, 3, 5, 7, 10]
+    # prepare container for each bin (center, then increasing rings)
+    bin_diffs = {i: [] for i in range(len(bins)-1)}
 
     print("\nWyniki oceny przez sieć neuronową:")
     for [fen, correct_eval], eval_score in zip(test_positions, evaluations):
@@ -103,12 +117,21 @@ def show_model_stats(model, val_loader, df):
             true_pawns = float(eval_str) / 100.0
             
         diff = abs(eval_score - true_pawns)
-        
-        # Распределяем ошибку по корзинам на основе НАСТОЯЩЕЙ оценки
-        if -4.0 <= true_pawns <= 4.0:
-            center_diffs.append(diff)
-        else:
-            extreme_diffs.append(diff)
+
+        # Распределяем ошибку по симметричным корзинам на основе абсолютной истинной оценки
+        a = abs(true_pawns)
+        # Найдём bin: first bin includes [0..1], next bins are (1..2], (2..3], (3..5], (5..7], (7..10]
+        for i in range(len(bins)-1):
+            low = bins[i]
+            high = bins[i+1]
+            if i == 0:
+                if a <= high:
+                    bin_diffs[i].append(diff)
+                    break
+            else:
+                if low < a <= high:
+                    bin_diffs[i].append(diff)
+                    break
             
         short_fen = fen.split()[0]
         if len(short_fen) > 30:
@@ -119,14 +142,17 @@ def show_model_stats(model, val_loader, df):
     # === ВЫВОД РАЗНИЦЫ ПО ДИАПАЗОНАМ ===
     print("\n" + "="*75)
     print("📊 Statystyki szczegółowe (na podstawie 1000 pozycji):")
-    
-    if center_diffs:
-        avg_center = sum(center_diffs) / len(center_diffs)
-        print(f"  Średni błąd w centrum (od -4 do +4): {avg_center:>5.2f} piona (Pozycji: {len(center_diffs)})")
-    
-    if extreme_diffs:
-        avg_extreme = sum(extreme_diffs) / len(extreme_diffs)
-        print(f"  Średni błąd na skrajach (poza +/-4): {avg_extreme:>5.2f} piona (Pozycji: {len(extreme_diffs)})")
+
+    # Формат вывода для каждой пары симметричных диапазонов
+    labels = ["[-1..1]", "(1..2]", "(2..3]", "(3..5]", "(5..7]", "(7..10]"]
+    for i, label in enumerate(labels):
+        vals = bin_diffs.get(i, [])
+        if vals:
+            avg = sum(vals) / len(vals)
+            print(f"  {label:8}  Średni błąd: {avg:>5.2f} piona  (Pozycji: {len(vals)})")
+        else:
+            print(f"  {label:8}  Brak pozycji (Pozycji: 0)")
+
     print("="*75 + "\n")
 
     evaluate_model_metrics(model, val_loader, device)
