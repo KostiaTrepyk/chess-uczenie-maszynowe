@@ -1,18 +1,21 @@
 import torch
 
 from core.architecture import ChessResNet
-from core.consts import NUM_BLOCKS, CHANNELS
 
-def export_model_to_onnx(  num_blocks=NUM_BLOCKS, channels=CHANNELS):
+def export_model_to_onnx():
     device = torch.device('cpu')
-    model = ChessResNet(channels=channels, num_blocks=num_blocks).to(device)
-    model.load_state_dict(torch.load("best_chess_model.pth", map_location=device))
+    
+    # 1. Инициализируем модель без аргументов (она сама возьмет 256 каналов и 20 блоков)
+    model = ChessResNet().to(device)
+    
+    # 2. Загружаем веса (добавлен weights_only=True для безопасности)
+    model.load_state_dict(torch.load("best_chess_model.pth", map_location=device, weights_only=True))
     model.eval()
 
-    # Tworzymy fałszywy tensor o odpowiednim kształcie (1 batch, 15 warstw, 8x8)
+    # 3. Создаем макет входа [Batch, Channels, Height, Width]
     dummy_input = torch.randn(1, 15, 8, 8, device=device)
 
-    # Eksportujemy
+    # 4. Экспортируем в ONNX
     torch.onnx.export(
         model,
         dummy_input,
@@ -20,6 +23,11 @@ def export_model_to_onnx(  num_blocks=NUM_BLOCKS, channels=CHANNELS):
         export_params=True,
         opset_version=18,
         input_names=['input'],
-        output_names=['output']
+        output_names=['output'],
+        # КРИТИЧЕСКИ ВАЖНО: Делаем размер батча (индекс 0) динамическим
+        dynamic_axes={
+            'input': {0: 'batch_size'},
+            'output': {0: 'batch_size'}
+        }
     )
     print("✅ Plik chess_model.onnx jest gotowy!")

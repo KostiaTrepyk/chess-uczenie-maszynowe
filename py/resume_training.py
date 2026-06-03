@@ -11,7 +11,7 @@ if __name__ == '__main__':
 
     train_loader, val_loader = prepare_dataset_with_split(df)
 
-    model = train_model(train_loader, val_loader, resume_path="checkpoint.pth")
+    model = train_model(train_loader, val_loader, resume_path="best_chess_model.pth")
 
     # Ocena modelu
     print('\nOcena modelu na walidacyjnym zbiorze danych:')

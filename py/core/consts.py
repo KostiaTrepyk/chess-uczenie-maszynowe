@@ -7,15 +7,15 @@ BATCH_SIZE = 256
 MAX_VALIDATION_BATCHES = 100
 
 CHECKS_PER_EPOCH = 40
-EPOCHS = 12
+EPOCHS = 1
 
 START_LR = 0.001
-RESUME_START_LR = 0.00005
+RESUME_START_LR = 0.000025
 
 KERNEL_SIZE = 3
 PADDING = 1
 
-WDL_SCALE = 4  # Константа растяжения сигмоиды
+WDL_SCALE = 5  # Константа растяжения сигмоиды
 
 PIECE_TO_CHANNEL = {
     'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,

@@ -20,7 +20,13 @@ py/chess_premium.tar.gz
 *.pth
 *.pt
 *.onnx
+*.onnx.data
 
 # 5. Логи и системные файлы
 *.log
 .DS_Store
+
+# 6.
+py/core/ChessNNUE.py
+py/train_nnue.py
+py/nnue_stats.py
