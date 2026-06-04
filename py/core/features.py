@@ -16,7 +16,7 @@ def clean_eval_to_float(eval_str: str | float) -> float:
     else:
         eval_pawns = float(eval_str) / 100.0
         
-    eval_pawns = max(MIN_EVAL, min(MAX_EVAL, eval_pawns))
+    # eval_pawns = max(MIN_EVAL, min(MAX_EVAL, eval_pawns))
     
     # Формула конвертации пешек в вероятность победы (Sigmoid)
     win_prob = 1.0 / (1.0 + math.exp(-eval_pawns / WDL_SCALE))

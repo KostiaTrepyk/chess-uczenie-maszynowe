@@ -15,7 +15,7 @@ RESUME_START_LR = 0.000025
 KERNEL_SIZE = 3
 PADDING = 1
 
-WDL_SCALE = 5  # Константа растяжения сигмоиды
+WDL_SCALE = 3  # Константа растяжения сигмоиды
 
 PIECE_TO_CHANNEL = {
     'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,

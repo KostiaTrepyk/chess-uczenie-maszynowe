@@ -17,6 +17,10 @@ export default function Home() {
 	const [aiScore, setAiScore] = useState<number | null>(null);
 	const [isModelVsModelPaused, setIsModelVsModelPaused] = useState(false);
 	const [moveDelay, setMoveDelay] = useState<number>(1); // seconds for model-vs-model
+	const [searchMode, setSearchMode] = useState<"simple" | "advanced">(
+		"simple",
+	);
+	const [searchDepth, setSearchDepth] = useState<number>(2);
 
 	const isFetching = useRef(false);
 	const modelMoveTimerRef = useRef<number | null>(null);
@@ -25,23 +29,20 @@ export default function Home() {
 	const isWhiteTurn = game.turn() === "w";
 	const isGameOver = game.isGameOver();
 
-	const makeMove = useCallback(
-		(move: MoveInput, currentGame: Chess) => {
-			try {
-				const gameCopy = new Chess();
-				gameCopy.loadPgn(currentGame.pgn());
-				const result = gameCopy.move(move);
-				if (result) {
-					setGame(gameCopy);
-					return gameCopy;
-				}
-			} catch {
-				return null;
+	const makeMove = useCallback((move: MoveInput, currentGame: Chess) => {
+		try {
+			const gameCopy = new Chess();
+			gameCopy.loadPgn(currentGame.pgn());
+			const result = gameCopy.move(move);
+			if (result) {
+				setGame(gameCopy);
+				return gameCopy;
 			}
+		} catch {
 			return null;
-		},
-		[],
-	);
+		}
+		return null;
+	}, []);
 
 	const fetchAiMove = useCallback(
 		async (currentGame: Chess) => {
@@ -53,7 +54,11 @@ export default function Home() {
 				const response = await fetch("/api/move", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ fen: currentGame.fen() }),
+					body: JSON.stringify({
+						fen: currentGame.fen(),
+						searchMode,
+						searchDepth,
+					}),
 				});
 				const data = await response.json();
 
@@ -68,7 +73,7 @@ export default function Home() {
 				isFetching.current = false;
 			}
 		},
-		[makeMove],
+		[makeMove, searchMode, searchDepth],
 	);
 
 	useEffect(() => {
@@ -88,10 +93,13 @@ export default function Home() {
 		if (!aiShouldMove || isAiThinking || isFetching.current) return;
 
 		if (gameMode === "model-vs-model") {
-			modelMoveTimerRef.current = window.setTimeout(() => {
-				modelMoveTimerRef.current = null;
-				fetchAiMove(game);
-			}, Math.max(0, moveDelay) * 1000);
+			modelMoveTimerRef.current = window.setTimeout(
+				() => {
+					modelMoveTimerRef.current = null;
+					fetchAiMove(game);
+				},
+				Math.max(0, moveDelay) * 1000,
+			);
 			return;
 		}
 
@@ -99,7 +107,15 @@ export default function Home() {
 			modelMoveTimerRef.current = null;
 			fetchAiMove(game);
 		}, 0);
-	}, [game, isGameOver, gameMode, isAiThinking, isModelVsModelPaused, moveDelay, fetchAiMove]);
+	}, [
+		game,
+		isGameOver,
+		gameMode,
+		isAiThinking,
+		isModelVsModelPaused,
+		moveDelay,
+		fetchAiMove,
+	]);
 
 	useEffect(() => {
 		return () => {
@@ -260,7 +276,11 @@ export default function Home() {
 					<button
 						className="bg-gray-600 hover:bg-gray-500 disabled:opacity-50 px-6 py-2 rounded-lg font-semibold text-white transition-colors"
 						onClick={undoMove}
-						disabled={game.history().length === 0 || isAiThinking || gameMode === "model-vs-model"}
+						disabled={
+							game.history().length === 0 ||
+							isAiThinking ||
+							gameMode === "model-vs-model"
+						}
 					>
 						Cofnij ruch
 					</button>
@@ -275,17 +295,28 @@ export default function Home() {
 					)}
 					{gameMode === "model-vs-model" && (
 						<div className="flex items-center gap-3 px-2">
-							<label className="text-gray-300 text-sm">Interwał:</label>
+							<label className="text-gray-300 text-sm">
+								Interwał:
+							</label>
 							<input
 								type="range"
 								min={0}
 								max={5}
 								step={0.1}
 								value={moveDelay}
-								onChange={(e) => setMoveDelay(parseFloat((e.target as HTMLInputElement).value))}
+								onChange={(e) =>
+									setMoveDelay(
+										parseFloat(
+											(e.target as HTMLInputElement)
+												.value,
+										),
+									)
+								}
 								className="w-40"
 							/>
-							<div className="w-12 text-gray-200 text-sm">{moveDelay.toFixed(1)}s</div>
+							<div className="w-12 text-gray-200 text-sm">
+								{moveDelay.toFixed(1)}s
+							</div>
 						</div>
 					)}
 					<button
@@ -295,6 +326,49 @@ export default function Home() {
 						Nowa gra
 					</button>
 				</div>
+			</div>
+			<div className="flex items-center gap-4 mt-4">
+				<div className="text-gray-300 text-sm">Tryb ruchu:</div>
+				<button
+					className={`px-3 py-1 rounded-md text-sm ${searchMode === "simple" ? "bg-blue-700 text-gray-200" : "bg-gray-700 text-white"}`}
+					onClick={() => setSearchMode("simple")}
+				>
+					Prosty
+				</button>
+				<button
+					className={`px-3 py-1 rounded-md text-sm ${searchMode === "advanced" ? "bg-blue-700 text-gray-200" : "bg-gray-700 text-white"}`}
+					onClick={() => setSearchMode("advanced")}
+				>
+					Zaawansowany
+				</button>
+				{searchMode === "advanced" && (
+					<div className="flex items-center gap-2">
+						<label className="text-gray-300 text-sm">
+							Głębokość:
+						</label>
+						<input
+							type="number"
+							min={1}
+							max={5}
+							value={searchDepth}
+							onChange={(e) =>
+								setSearchDepth(
+									Math.max(
+										1,
+										Math.min(
+											6,
+											parseInt(
+												(e.target as HTMLInputElement)
+													.value || "1",
+											),
+										),
+									),
+								)
+							}
+							className="bg-gray-700 px-2 py-1 rounded-md w-16 text-white text-sm"
+						/>
+					</div>
+				)}
 			</div>
 		</main>
 	);

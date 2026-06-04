@@ -7,17 +7,33 @@ def export_model_to_onnx():
     model.load_state_dict(torch.load("best_chess_model.pth", map_location=device, weights_only=True))
     model.eval()
 
-    # СТРОГО 1 ДОСКА: убираем динамику, чтобы Трансформер работал идеально
-    dummy_input = torch.randn(1, 15, 8, 8, device=device)
+    # Используем динамический batch (первое измерение), чтобы ONNX поддерживал батчинг
+    # Use a small batch >1 so ONNX export records batched ops correctly
+    dummy_input = torch.randn(4, 15, 8, 8, device=device)
 
+    dynamic_axes = {
+        'input': {0: 'batch'},
+        'output': {0: 'batch'}
+    }
+
+    out_path = "chess_model.onnx"
     torch.onnx.export(
         model,
         dummy_input,
-        "chess_model.onnx",
+        out_path,
         export_params=True,
         opset_version=18,
         input_names=['input'],
-        output_names=['output']
-        # dynamic_axes УДАЛЕНЫ
+        output_names=['output'],
+        dynamic_axes=dynamic_axes
     )
-    print("✅ Plik chess_model.onnx jest gotowy (Strict Batch = 1)!")
+
+    # Also copy the exported ONNX to the webapp models folder so the Next server can load it
+    try:
+        import shutil, os
+        target_dir = os.path.join(os.getcwd(), "webapp", "models")
+        os.makedirs(target_dir, exist_ok=True)
+        shutil.copy(out_path, os.path.join(target_dir, "chess_model.onnx"))
+        print(f"✅ chess_model.onnx exported and copied to {target_dir}")
+    except Exception as e:
+        print("⚠️ Exported ONNX but failed to copy to webapp/models:", e)
