@@ -94,7 +94,7 @@ export function decodeEvaluations(
 	batchSize: number,
 ): number[] {
 	const scores: number[] = [];
-	const WDL_SCALE = 5.0; // Берем из твоего consts.py!
+	const WDL_SCALE = 3.0; // Берем из твоего consts.py!
 
 	for (let b = 0; b < batchSize; b++) {
 		const rawLogit = logits[b];

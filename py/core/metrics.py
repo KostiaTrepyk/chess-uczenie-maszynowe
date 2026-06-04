@@ -104,7 +104,7 @@ def show_model_stats(model, val_loader, df):
 
     # Списки для подсчета средней ошибки по диапазонам
     # Бины: symmetric ranges specified by user: 1,2,3,5,7,10
-    bins = [0, 1, 2, 3, 5, 7, 10]
+    bins = [0, 2, 5, 7, 10, 15, 100]
     # prepare container for each bin (center, then increasing rings)
     bin_diffs = {i: [] for i in range(len(bins)-1)}
 
@@ -144,7 +144,7 @@ def show_model_stats(model, val_loader, df):
     print("📊 Statystyki szczegółowe (na podstawie 1000 pozycji):")
 
     # Формат вывода для каждой пары симметричных диапазонов
-    labels = ["[-1..1]", "(1..2]", "(2..3]", "(3..5]", "(5..7]", "(7..10]"]
+    labels = ["[-2..2]", "(2..5]", "(5..7]", "(7..10]", "(10..15]", "(15..100]"]
     for i, label in enumerate(labels):
         vals = bin_diffs.get(i, [])
         if vals:

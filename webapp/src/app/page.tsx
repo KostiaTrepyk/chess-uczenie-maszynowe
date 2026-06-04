@@ -6,26 +6,27 @@ import { Chessboard as OriginalChessboard } from "react-chessboard";
 
 const Chessboard = OriginalChessboard;
 
-type GameMode = "ai-black" | "ai-white" | "pvp";
+type GameMode = "ai-black" | "ai-white" | "pvp" | "model-vs-model";
+
+type MoveInput = Parameters<Chess["move"]>[0];
 
 export default function Home() {
 	const [game, setGame] = useState(new Chess());
 	const [gameMode, setGameMode] = useState<GameMode>("ai-black");
 	const [isAiThinking, setIsAiThinking] = useState(false);
 	const [aiScore, setAiScore] = useState<number | null>(null);
+	const [isModelVsModelPaused, setIsModelVsModelPaused] = useState(false);
+	const [moveDelay, setMoveDelay] = useState<number>(1); // seconds for model-vs-model
 
-	const fetchLock = useRef(false);
 	const isFetching = useRef(false);
+	const modelMoveTimerRef = useRef<number | null>(null);
 
 	const currentFen = game.fen();
 	const isWhiteTurn = game.turn() === "w";
 	const isGameOver = game.isGameOver();
 
 	const makeMove = useCallback(
-		(
-			move: { from: string; to: string; promotion?: string },
-			currentGame: Chess,
-		) => {
+		(move: MoveInput, currentGame: Chess) => {
 			try {
 				const gameCopy = new Chess();
 				gameCopy.loadPgn(currentGame.pgn());
@@ -34,7 +35,7 @@ export default function Home() {
 					setGame(gameCopy);
 					return gameCopy;
 				}
-			} catch (e: any) {
+			} catch {
 				return null;
 			}
 			return null;
@@ -71,17 +72,43 @@ export default function Home() {
 	);
 
 	useEffect(() => {
-		if (isGameOver) return;
+		if (modelMoveTimerRef.current) {
+			clearTimeout(modelMoveTimerRef.current);
+			modelMoveTimerRef.current = null;
+		}
+
+		if (isGameOver || isModelVsModelPaused) return;
 
 		const isWhiteTurn = game.turn() === "w";
 		const aiShouldMove =
+			gameMode === "model-vs-model" ||
 			(gameMode === "ai-black" && !isWhiteTurn) ||
 			(gameMode === "ai-white" && isWhiteTurn);
 
-		if (aiShouldMove && !isAiThinking && !isFetching.current) {
-			fetchAiMove(game);
+		if (!aiShouldMove || isAiThinking || isFetching.current) return;
+
+		if (gameMode === "model-vs-model") {
+			modelMoveTimerRef.current = window.setTimeout(() => {
+				modelMoveTimerRef.current = null;
+				fetchAiMove(game);
+			}, Math.max(0, moveDelay) * 1000);
+			return;
 		}
-	}, [game, isGameOver, gameMode, isAiThinking, fetchAiMove]);
+
+		modelMoveTimerRef.current = window.setTimeout(() => {
+			modelMoveTimerRef.current = null;
+			fetchAiMove(game);
+		}, 0);
+	}, [game, isGameOver, gameMode, isAiThinking, isModelVsModelPaused, moveDelay, fetchAiMove]);
+
+	useEffect(() => {
+		return () => {
+			if (modelMoveTimerRef.current) {
+				clearTimeout(modelMoveTimerRef.current);
+				modelMoveTimerRef.current = null;
+			}
+		};
+	}, []);
 
 	const onDrop = useCallback(
 		(args: {
@@ -111,10 +138,7 @@ export default function Home() {
 				};
 			if (isPromotion) moveParams.promotion = "q";
 
-			const newGame = makeMove(
-				{ from: sourceSquare, to: targetSquare },
-				game,
-			);
+			const newGame = makeMove(moveParams, game);
 			return newGame !== null;
 		},
 		[game, gameMode, isWhiteTurn, isAiThinking, makeMove],
@@ -125,8 +149,14 @@ export default function Home() {
 		setGame(new Chess());
 		setAiScore(null);
 		setIsAiThinking(false);
-		fetchLock.current = false;
+		setIsModelVsModelPaused(false);
 	}, []);
+
+	const toggleModelVsModelPause = useCallback(() => {
+		if (gameMode !== "model-vs-model") return;
+
+		setIsModelVsModelPaused((paused) => !paused);
+	}, [gameMode]);
 
 	const undoMove = useCallback(() => {
 		if (isAiThinking) return;
@@ -174,6 +204,12 @@ export default function Home() {
 					>
 						PvP
 					</button>
+					<button
+						onClick={() => startNewGame("model-vs-model")}
+						className={`px-4 py-2 rounded-lg font-semibold transition-colors ${gameMode === "model-vs-model" ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-300 hover:bg-gray-600"}`}
+					>
+						Model vs Model
+					</button>
 				</div>
 
 				<div className="mb-4 w-full max-w-125">
@@ -183,6 +219,8 @@ export default function Home() {
 								<span className="text-yellow-400 animate-pulse">
 									🤖 AI myśli...
 								</span>
+							) : gameMode === "model-vs-model" ? (
+								<span>🤖 Modele grają między sobą</span>
 							) : gameMode !== "pvp" ? (
 								<span>🤖 AI czeka na twój ruch</span>
 							) : (
@@ -190,7 +228,7 @@ export default function Home() {
 							)}
 						</div>
 						{aiScore !== null && gameMode !== "pvp" && (
-							<div className="font-mono font-bold text-sm">
+							<div className="font-mono font-bold text-sm whitespace-nowrap">
 								{aiScore > 0 ? "+" : ""}
 								{aiScore.toFixed(2)}
 							</div>
@@ -222,10 +260,34 @@ export default function Home() {
 					<button
 						className="bg-gray-600 hover:bg-gray-500 disabled:opacity-50 px-6 py-2 rounded-lg font-semibold text-white transition-colors"
 						onClick={undoMove}
-						disabled={game.history().length === 0 || isAiThinking}
+						disabled={game.history().length === 0 || isAiThinking || gameMode === "model-vs-model"}
 					>
 						Cofnij ruch
 					</button>
+					{gameMode === "model-vs-model" && (
+						<button
+							className={`px-6 py-2 rounded-lg font-semibold text-white transition-colors ${isModelVsModelPaused ? "bg-emerald-600 hover:bg-emerald-500" : "bg-amber-600 hover:bg-amber-500"}`}
+							onClick={toggleModelVsModelPause}
+							disabled={isGameOver}
+						>
+							{isModelVsModelPaused ? "Kontynuuj" : "Pauza"}
+						</button>
+					)}
+					{gameMode === "model-vs-model" && (
+						<div className="flex items-center gap-3 px-2">
+							<label className="text-gray-300 text-sm">Interwał:</label>
+							<input
+								type="range"
+								min={0}
+								max={5}
+								step={0.1}
+								value={moveDelay}
+								onChange={(e) => setMoveDelay(parseFloat((e.target as HTMLInputElement).value))}
+								className="w-40"
+							/>
+							<div className="w-12 text-gray-200 text-sm">{moveDelay.toFixed(1)}s</div>
+						</div>
+					)}
 					<button
 						className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-semibold text-white transition-colors"
 						onClick={() => startNewGame(gameMode)}
