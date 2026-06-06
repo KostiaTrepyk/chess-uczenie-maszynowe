@@ -27,6 +27,6 @@ py/chess_premium.tar.gz
 .DS_Store
 
 # 6.
-py/core/ChessNNUE.py
-py/train_nnue.py
-py/nnue_stats.py
+# py/core/ChessNNUE.py
+# py/train_nnue.py
+# py/nnue_stats.py
