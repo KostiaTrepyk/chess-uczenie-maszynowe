@@ -13,8 +13,21 @@ def export_model_to_onnx():
 
     dynamic_axes = {
         'input': {0: 'batch'},
-        'output': {0: 'batch'}
+        'score': {0: 'batch'}, # <--- Изменили
+        'mate': {0: 'batch'}   # <--- Добавили
     }
+
+    out_path = "chess_model.onnx"
+    torch.onnx.export(
+        model,
+        dummy_input,
+        out_path,
+        export_params=True,
+        opset_version=18,
+        input_names=['input'],
+        output_names=['score', 'mate'], # <--- Изменили
+        dynamic_axes=dynamic_axes
+    )
 
     out_path = "chess_model.onnx"
     torch.onnx.export(

@@ -60,21 +60,29 @@ class ChessResNet(nn.Module):
         )
         self.resnet_blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(num_blocks)])
         self.transformer = nn.Sequential(*[TransformerBlock(channels=channels, heads=TransformerBlockHeads) for _ in range(num_transformer_blocks)])
-        self.value_head = nn.Sequential(
+        
+        # Общие признаки для оценки
+        self.value_features = nn.Sequential(
             nn.Conv2d(channels, 4, kernel_size=1),
             nn.BatchNorm2d(4),
             nn.LeakyReLU(0.1),
             nn.Flatten(),
             nn.Linear(256, 256),
             nn.LeakyReLU(0.1),
-            nn.Linear(256, 1),
         )
+        # ДВЕ ГОЛОВЫ:
+        self.score_out = nn.Linear(256, 1) # Голова 1: Пешки
+        self.mate_out = nn.Linear(256, 1)  # Голова 2: Вероятность мата
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.input_conv(x)
         x = self.resnet_blocks(x)
         x = self.transformer(x)
-        return self.value_head(x).squeeze(-1)
+        
+        features = self.value_features(x)
+        
+        # Возвращаем кортеж из двух значений
+        return self.score_out(features).squeeze(-1), self.mate_out(features).squeeze(-1)
 
 def load_model(num_blocks=NUM_BLOCKS, channels=CHANNELS)-> ChessResNet:
     # Wczytujemy gotowy model

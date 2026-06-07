@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from core.metrics import prob_to_pawns
+from core.metrics import evaluate_model_metrics
 from core.architecture import ChessResNet
 from core.features import build_batch_on_gpu
 from core.consts import CHECKS_PER_EPOCH, MAX_VALIDATION_BATCHES, EPOCHS, START_LR, RESUME_START_LR
@@ -16,7 +16,10 @@ def train_model(train_loader: DataLoader, val_loader: DataLoader, resume_path: s
     torch.backends.cudnn.benchmark = True
     model = ChessResNet().to(device)
 
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_wdl_fn = nn.MSELoss(reduction='none')
+    loss_pawns_fn = nn.SmoothL1Loss(beta=1.0, reduction='none')
+    loss_mate_fn = nn.BCEWithLogitsLoss(reduction='none')
+    alpha = 2.0
     best_val_loss = float('inf')
     start_lr = START_LR
     start_epoch = 0
@@ -68,7 +71,7 @@ def train_model(train_loader: DataLoader, val_loader: DataLoader, resume_path: s
         print("Ocena początkowego modelu (Baseline Validation)...")
         model.eval()
         val_loss = 0.0
-        val_mae = 0.0  
+        total_baseline_mae = 0.0  
         val_steps_taken = 0
         total_baseline_pos = 0
         
@@ -78,24 +81,36 @@ def train_model(train_loader: DataLoader, val_loader: DataLoader, resume_path: s
                 boards, turns, castling, eps, val_targets = [x.to(device, non_blocking=True) for x in val_data]
                 val_inputs = build_batch_on_gpu(boards, turns, castling, eps)
                 
-                val_targets = torch.where(turns == 0, 1.0 - val_targets, val_targets)
+                # ТЕПЕРЬ ТУТ ТОЖЕ ПЕШКИ (ИНВЕРСИЯ ЗНАКА ЧЕРЕЗ МИНУС)
+                val_targets = torch.where(turns == 0, -val_targets, val_targets)
         
-                val_preds = model(val_inputs)
+                v_score_preds, v_mate_preds = model(val_inputs)
                 
-                v_loss = loss_fn(val_preds, val_targets)
+                # --- ГИБРИДНЫЙ ЛОСС ---
+                v_weights = torch.ones_like(val_targets)
+                v_weights[torch.abs(val_targets) >= 8.0] = 4.0
+                
+                v_preds_wdl = torch.sigmoid(v_score_preds / 4.0)
+                v_targets_wdl = torch.sigmoid(val_targets / 4.0)
+                v_loss_wdl = (loss_wdl_fn(v_preds_wdl, v_targets_wdl) * v_weights).mean()
+                
+                v_loss_pawns = (loss_pawns_fn(v_score_preds, val_targets) * v_weights).mean()
+                
+                v_targets_mate = (torch.abs(val_targets) > 15.0).float()
+                v_loss_mate = (loss_mate_fn(v_mate_preds, v_targets_mate) * v_weights).mean()
+                
+                v_loss = (0.8 * v_loss_wdl) + (0.2 * v_loss_pawns) + (alpha * v_loss_mate)
                 val_loss += v_loss.item()
                 
-                preds_pawns = prob_to_pawns(torch.sigmoid(val_preds))
-                targets_pawns = prob_to_pawns(val_targets)
-                
-                val_mae += torch.abs(preds_pawns - targets_pawns).sum().item()
+                # Подсчет MAE (напрямую в пешках)
+                total_baseline_mae += torch.abs(v_score_preds - val_targets).sum().item()
                 total_baseline_pos += val_targets.size(0)
                 
                 val_steps_taken += 1
         
         # Перезаписываем best_val_loss, чтобы старт был от свежей валидации
         best_val_loss = val_loss / val_steps_taken
-        best_val_mae = val_mae / total_baseline_pos
+        best_val_mae = total_baseline_mae / total_baseline_pos
         
         print(f">>> Baseline Val Loss: {best_val_loss:.4f} | Val MAE: {best_val_mae:.2f}\n")
 
@@ -119,13 +134,28 @@ def train_model(train_loader: DataLoader, val_loader: DataLoader, resume_path: s
             boards, turns, castling, eps, batch_targets = [x.to(device, non_blocking=True) for x in batch_data]
             batch_inputs = build_batch_on_gpu(boards, turns, castling, eps)
             
-            batch_targets = torch.where(turns == 0, 1.0 - batch_targets, batch_targets)
+            # Т.к. теперь это пешки, мы инвертируем их через минус (а не 1.0 - x)
+            batch_targets = torch.where(turns == 0, -batch_targets, batch_targets)
 
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_str):
-                predictions = model(batch_inputs)
-                loss = loss_fn(predictions, batch_targets)
+                score_preds, mate_preds = model(batch_inputs)
+                
+                # --- ГИБРИДНЫЙ ЛОСС И HARD EXAMPLE MINING ---
+                weights = torch.ones_like(batch_targets)
+                weights[torch.abs(batch_targets) >= 8.0] = 4.0 # Штраф х4 за зевки
+                
+                preds_wdl = torch.sigmoid(score_preds / 4.0)
+                targets_wdl = torch.sigmoid(batch_targets / 4.0)
+                loss_wdl = (loss_wdl_fn(preds_wdl, targets_wdl) * weights).mean()
+                
+                loss_pawns = (loss_pawns_fn(score_preds, batch_targets) * weights).mean()
+                
+                targets_mate = (torch.abs(batch_targets) > 15.0).float()
+                loss_mate = (loss_mate_fn(mate_preds, targets_mate) * weights).mean()
+                
+                loss = (0.8 * loss_wdl) + (0.2 * loss_pawns) + (alpha * loss_mate)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -159,17 +189,27 @@ def train_model(train_loader: DataLoader, val_loader: DataLoader, resume_path: s
                         boards, turns, castling, eps, val_targets = [x.to(device, non_blocking=True) for x in val_data]
                         val_inputs = build_batch_on_gpu(boards, turns, castling, eps)
                         
-                        val_targets = torch.where(turns == 0, 1.0 - val_targets, val_targets)
+                        val_targets = torch.where(turns == 0, -val_targets, val_targets)
 
-                        val_preds = model(val_inputs)
+                        v_score_preds, v_mate_preds = model(val_inputs)
                         
-                        v_loss = loss_fn(val_preds, val_targets)
+                        v_weights = torch.ones_like(val_targets)
+                        v_weights[torch.abs(val_targets) >= 8.0] = 4.0
+                        
+                        v_preds_wdl = torch.sigmoid(v_score_preds / 4.0)
+                        v_targets_wdl = torch.sigmoid(val_targets / 4.0)
+                        v_loss_wdl = (loss_wdl_fn(v_preds_wdl, v_targets_wdl) * v_weights).mean()
+                        
+                        v_loss_pawns = (loss_pawns_fn(v_score_preds, val_targets) * v_weights).mean()
+                        
+                        v_targets_mate = (torch.abs(val_targets) > 15.0).float()
+                        v_loss_mate = (loss_mate_fn(v_mate_preds, v_targets_mate) * v_weights).mean()
+                        
+                        v_loss = (0.8 * v_loss_wdl) + (0.2 * v_loss_pawns) + (alpha * v_loss_mate)
                         val_loss += v_loss.item()
                         
-                        preds_pawns = prob_to_pawns(torch.sigmoid(val_preds))
-                        targets_pawns = prob_to_pawns(val_targets)
-                        
-                        total_val_mae += torch.abs(preds_pawns - targets_pawns).sum().item()
+                        # Подсчет MAE (напрямую в пешках)
+                        total_val_mae += torch.abs(v_score_preds - val_targets).sum().item()
                         total_val_pos += val_targets.size(0)
                         
                         val_steps_taken += 1

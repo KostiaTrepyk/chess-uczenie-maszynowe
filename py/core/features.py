@@ -1,26 +1,21 @@
-import math
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from core.consts import CHAR_TO_INT_TOKEN, MIN_EVAL, MAX_EVAL, WDL_SCALE
+from core.consts import CHAR_TO_INT_TOKEN
     
 def clean_eval_to_float(eval_str: str | float) -> float:
-    """Конвертирует оценку в пешках в вероятность победы (0.0 ... 1.0)."""
+    """Возвращает СЫРЫЕ пешки. Маты оцениваются в +/- 30.0"""
     eval_str = str(eval_str).strip()
     if eval_str.startswith('\ufeff'): eval_str = eval_str[1:]
     
     if eval_str.startswith('#'):
-        eval_pawns = 10.0 if eval_str[1] == '+' else -10.0
+        # Увеличиваем вес мата до 30 пешек, чтобы сеть видела разницу
+        eval_pawns = 30.0 if eval_str[1] == '+' else -30.0
     else:
         eval_pawns = float(eval_str) / 100.0
         
-    # eval_pawns = max(MIN_EVAL, min(MAX_EVAL, eval_pawns))
-    
-    # Формула конвертации пешек в вероятность победы (Sigmoid)
-    win_prob = 1.0 / (1.0 + math.exp(-eval_pawns / WDL_SCALE))
-    return win_prob
+    return eval_pawns
 
 def tokenize_fen(fen: str) -> tuple[np.ndarray, np.uint8, np.ndarray, np.uint8]:
     """Разбирает FEN строку на числовые массивы."""
