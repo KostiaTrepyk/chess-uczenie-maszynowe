@@ -5,7 +5,7 @@ let session: ort.InferenceSession | null = null;
 
 export async function getModelSession(): Promise<ort.InferenceSession> {
 	if (!session) {
-		const modelPath = path.join(process.cwd(), "models", "chess_model.onnx"); // Или chess_model_int8.onnx после Шага 3
+		const modelPath = path.join(process.cwd(), "models", "chess_model.onnx");
 		
 		session = await ort.InferenceSession.create(modelPath, { 
 			executionProviders: ["cpu"],

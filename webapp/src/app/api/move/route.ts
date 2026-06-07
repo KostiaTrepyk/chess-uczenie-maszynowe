@@ -1,130 +1,154 @@
 import { NextResponse } from "next/server";
 import { Chess } from "chess.js";
 import { getModelSession } from "@/lib/onnx";
-import { createBatchTensor, decodeEvaluations } from "@/lib/tensor";
+import { createResNetTensor } from "@/lib/tensor"; // <--- ОБНОВЛЕНО
 
-// Глобальный кэш (очищается при перезапуске сервера, можно вынести внутрь POST для очистки на каждый ход)
 const evalCache = new Map<string, number>();
 
-async function evaluateBatch(fens: string[], session: any): Promise<number[]> {
-	const scores = new Array(fens.length).fill(0);
-	const fensToEvaluate: string[] = [];
-	const indicesToEvaluate: number[] = [];
+async function evaluatePosition(fen: string, session: any): Promise<number> {
+	// Убираем счетчики полуходов для кэширования
+	const cleanFen = fen.split(" ").slice(0, 4).join(" ");
+	if (evalCache.has(cleanFen)) return evalCache.get(cleanFen)!;
 
-	// 1. Проверяем кэш
-	for (let i = 0; i < fens.length; i++) {
-		// Убираем счетчики полуходов из FEN, они не влияют на оценку доски
-		const cleanFen = fens[i].split(" ").slice(0, 4).join(" ");
-		if (evalCache.has(cleanFen)) {
-			scores[i] = evalCache.get(cleanFen)!;
-		} else {
-			fensToEvaluate.push(fens[i]);
-			indicesToEvaluate.push(i);
-		}
+	// Создаем правильный 3D тензор
+	const feeds = createResNetTensor(fen);
+	const results = await session.run(feeds);
+
+	// Читаем две головы из Трансформера
+	const rawScore = (results["score"].data as Float32Array)[0];
+	const mateLogit = (results["mate"].data as Float32Array)[0];
+
+	const mateProb = 1 / (1 + Math.exp(-mateLogit));
+
+	let finalScore = rawScore;
+
+	// Матовый приоритет
+	if (mateProb > 0.85) {
+		finalScore = rawScore > 0 ? 30.0 : -30.0;
 	}
 
-	// 2. Если есть неизвестные позиции - прогоняем через ИИ
-	if (fensToEvaluate.length > 0) {
-		const inputTensor = createBatchTensor(fensToEvaluate);
-		const feeds = { [session.inputNames[0]]: inputTensor };
-
-		const results = await session.run(feeds);
-		const logits = results[session.outputNames[0]].data as Float32Array;
-
-		const newScores = decodeEvaluations(logits, fensToEvaluate.length);
-
-		// 3. Сохраняем результаты и пишем в кэш
-		for (let j = 0; j < newScores.length; j++) {
-			const originalIndex = indicesToEvaluate[j];
-			const fen = fensToEvaluate[j];
-			const cleanFen = fen.split(" ").slice(0, 4).join(" ");
-
-			// Каноническое выравнивание
-			const finalScore = fen.includes(" b ")
-				? -newScores[j]
-				: newScores[j];
-
-			scores[originalIndex] = finalScore;
-			evalCache.set(cleanFen, finalScore);
-		}
-	}
-
-	return scores;
+	evalCache.set(cleanFen, finalScore);
+	return finalScore;
 }
 
-// 2. Рекурсивный алгоритм Beam Search (Лучевой минимакс)
-async function beamSearch(
-	fen: string,
-	depth: number,
-	beamWidth: number,
-	session: any,
-): Promise<{ move: any; score: number }> {
-	const game = new Chess(fen);
-	const isWhiteTurn = game.turn() === "w";
-	const legalMoves = game.moves({ verbose: true });
-
-	// Базовые случаи: конец игры или отсутствие ходов
-	if (legalMoves.length === 0) {
-		if (game.isCheckmate())
-			return { move: null, score: isWhiteTurn ? -100 : 100 };
-		return { move: null, score: 0 };
-	}
-
-	// Шаг 1: Генерируем все будущие позиции (ширина текущего узла)
-	const nextFens = legalMoves.map((m) => {
-		const temp = new Chess(game.fen());
-		temp.move(m);
-		return temp.fen();
+// Упорядочивание ходов (КРИТИЧЕСКИ ВАЖНО ДЛЯ АЛЬФА-БЕТЫ)
+// Если мы сначала смотрим хорошие ходы, альфа-бета отсекает 90% дерева
+function orderMoves(game: Chess, moves: string[]) {
+	return moves.sort((a, b) => {
+		let scoreA = 0,
+			scoreB = 0;
+		if (a.includes("x")) scoreA += 10; // Взятия проверяем первыми
+		if (a.includes("+")) scoreA += 5; // Шахи
+		if (b.includes("x")) scoreB += 10;
+		if (b.includes("+")) scoreB += 5;
+		return scoreB - scoreA;
 	});
+}
 
-	// Шаг 2: Параллельно оцениваем их все в нейросети (1 запрос на слой)
-	const scores = await evaluateBatch(nextFens, session);
+// Классический Alpha-Beta поиск
+async function alphaBeta(
+	game: Chess,
+	depth: number,
+	alpha: number,
+	beta: number,
+	isWhite: boolean,
+	session: any,
+): Promise<number> {
+	if (depth === 0 || game.isGameOver()) {
+		if (game.isCheckmate())
+			// ВАЖНО: + depth заставляет движок предпочитать БЫСТРЫЕ маты
+			// MateScore (10000) перебивает любые пешки (30.0)
+			return isWhite ? -(10000 + depth) : 10000 + depth;
+		if (game.isDraw()) return 0;
 
-	// Шаг 3: Сортируем ходы (Белые ищут максимум, Черные — минимум)
-	const scoredMoves = legalMoves.map((move, i) => ({
-		move,
-		fen: nextFens[i],
-		score: scores[i],
-	}));
+		if (depth === 0) {
+			return await evaluatePosition(game.fen(), session);
+		}
 
-	scoredMoves.sort((a, b) =>
-		isWhiteTurn ? b.score - a.score : a.score - b.score,
-	);
-
-	// Базовый случай 2: Достигли нужной глубины, возвращаем лучший локальный ход
-	if (depth <= 1) {
-		return { move: scoredMoves[0].move, score: scoredMoves[0].score };
+		// В идеале здесь должен быть Quiescence Search,
+		// но для начала просто вызываем нейросеть
+		return await evaluatePosition(game.fen(), session);
 	}
 
-	// Шаг 4: BEAM SEARCH - отрезаем слабые ходы, оставляем только ТОП-K (beamWidth)
-	const topMoves = scoredMoves.slice(0, beamWidth);
+	const moves = game.moves();
+	orderMoves(game, moves); // Сортируем ходы для максимального отсечения
 
-	let bestMove = topMoves[0].move;
-	let bestScore = isWhiteTurn ? -Infinity : Infinity;
+	if (isWhite) {
+		let maxEval = -Infinity;
+		for (const move of moves) {
+			game.move(move);
+			const ev = await alphaBeta(
+				game,
+				depth - 1,
+				alpha,
+				beta,
+				false,
+				session,
+			);
+			game.undo();
 
-	// Шаг 5: Погружаемся вглубь только для самых перспективных веток
-	for (const tm of topMoves) {
-		const childResult = await beamSearch(
-			tm.fen,
+			maxEval = Math.max(maxEval, ev);
+			alpha = Math.max(alpha, ev);
+			if (beta <= alpha) break; // Отсечение ветки!
+		}
+		return maxEval;
+	} else {
+		let minEval = Infinity;
+		for (const move of moves) {
+			game.move(move);
+			const ev = await alphaBeta(
+				game,
+				depth - 1,
+				alpha,
+				beta,
+				true,
+				session,
+			);
+			game.undo();
+
+			minEval = Math.min(minEval, ev);
+			beta = Math.min(beta, ev);
+			if (beta <= alpha) break; // Отсечение ветки!
+		}
+		return minEval;
+	}
+}
+
+async function getBestMove(fen: string, depth: number, session: any) {
+	const game = new Chess(fen);
+	const moves = game.moves();
+	let bestMove = moves[0];
+	const isWhite = game.turn() === "w";
+
+	let bestValue = isWhite ? -Infinity : Infinity;
+
+	for (const move of moves) {
+		game.move(move);
+		// Запускаем поиск для ветки
+		const boardValue = await alphaBeta(
+			game,
 			depth - 1,
-			beamWidth,
+			-Infinity,
+			Infinity,
+			!isWhite,
 			session,
 		);
+		game.undo();
 
-		if (isWhiteTurn) {
-			if (childResult.score > bestScore) {
-				bestScore = childResult.score;
-				bestMove = tm.move;
+		if (isWhite) {
+			if (boardValue > bestValue) {
+				bestValue = boardValue;
+				bestMove = move;
 			}
 		} else {
-			if (childResult.score < bestScore) {
-				bestScore = childResult.score;
-				bestMove = tm.move;
+			if (boardValue < bestValue) {
+				bestValue = boardValue;
+				bestMove = move;
 			}
 		}
 	}
 
-	return { move: bestMove, score: bestScore };
+	return { move: bestMove, score: bestValue };
 }
 
 export async function POST(req: Request) {
@@ -139,25 +163,16 @@ export async function POST(req: Request) {
 		let bestMoveResult;
 
 		if (searchMode === "advanced" && searchDepth > 1) {
-			const BEAM_WIDTH = 3; // Константа: сколько лучших веток исследовать дальше
-			console.log(
-				`\n🧠 [Beam Search] Start | Depth: ${searchDepth} | BeamWidth: ${BEAM_WIDTH}`,
-			);
+			console.log(`\n🧠 [Smart Search] Start | Depth: ${searchDepth}`);
 			const startTime = Date.now();
 
-			bestMoveResult = await beamSearch(
-				fen,
-				searchDepth,
-				BEAM_WIDTH,
-				session,
-			);
+			bestMoveResult = await getBestMove(fen, searchDepth, session);
 
 			console.log(
-				`⏱️ [Beam Search] Zakończono w ${Date.now() - startTime}ms`,
+				`⏱️ [Smart Search] Zakończono w ${Date.now() - startTime}ms`,
 			);
 		} else {
-			// Быстрый режим (глубина 1, смотрит все 30 ходов)
-			bestMoveResult = await beamSearch(fen, 1, 30, session);
+			bestMoveResult = await getBestMove(fen, 1, session);
 		}
 
 		return NextResponse.json({

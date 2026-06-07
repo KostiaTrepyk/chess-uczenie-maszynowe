@@ -1,6 +1,7 @@
 import * as ort from "onnxruntime-node";
 
-const PIECE_TO_CHANNEL: Record<string, number> = {
+// 0-5: Свои фигуры, 6-11: Чужие фигуры
+const PIECE_TO_CHANNEL_WHITE: Record<string, number> = {
 	P: 0,
 	N: 1,
 	B: 2,
@@ -15,102 +16,86 @@ const PIECE_TO_CHANNEL: Record<string, number> = {
 	k: 11,
 };
 
-export function createBatchTensor(fens: string[]): ort.Tensor {
-	const batchSize = fens.length;
-	const data = new Float32Array(batchSize * 15 * 64);
+// Если ход черных, мы меняем их фигуры местами, делая черные "своими" (0-5)
+const PIECE_TO_CHANNEL_BLACK: Record<string, number> = {
+	p: 0,
+	n: 1,
+	b: 2,
+	r: 3,
+	q: 4,
+	k: 5,
+	P: 6,
+	N: 7,
+	B: 8,
+	R: 9,
+	Q: 10,
+	K: 11,
+};
 
-	for (let b = 0; b < batchSize; b++) {
-		const parts = fens[b].split(" ");
-		const board = parts[0];
-		const isBlackTurn = parts[1] === "b";
-		const offset = b * 960; // 15 каналов * 64 клетки
+export function createResNetTensor(fen: string) {
+	// Создаем плоский массив для тензора 15 x 8 x 8 (960 элементов)
+	const tensorData = new Float32Array(15 * 8 * 8).fill(0.0);
+	const parts = fen.split(" ");
+	const board = parts[0];
+	const isWhiteTurn = parts[1] === "w";
+	const castling = parts[2] || "-";
+	const epStr = parts[3] || "-";
 
-		// --- 1. ПАРСИНГ ФИГУР (С КАНОНИЧЕСКИМ ОТРАЖЕНИЕМ) ---
-		let row = 0;
-		let col = 0;
+	// 1. СЛОИ 0-11: ФИГУРЫ
+	let rank = 0; // 0 - верхняя строка доски (8-я горизонталь)
+	let file = 0;
 
-		for (const char of board) {
-			if (char === "/") {
-				row++;
-				col = 0;
-			} else if (/\d/.test(char)) {
-				col += parseInt(char, 10);
-			} else {
-				let channel = PIECE_TO_CHANNEL[char];
-				let actualRow = row;
+	for (const char of board) {
+		if (char === "/") {
+			rank++;
+			file = 0;
+		} else if (/\d/.test(char)) {
+			file += parseInt(char, 10);
+		} else {
+			// КАНОНИЧЕСКАЯ МАГИЯ: Если ход черных, переворачиваем доску по вертикали
+			const mappedRank = isWhiteTurn ? rank : 7 - rank;
+			const sq = mappedRank * 8 + file;
+			const channel = isWhiteTurn
+				? PIECE_TO_CHANNEL_WHITE[char]
+				: PIECE_TO_CHANNEL_BLACK[char];
 
-				// МАГИЯ ИЗ features.py: Если ход черных, переворачиваем доску и меняем цвета
-				if (isBlackTurn) {
-					actualRow = 7 - row; // Отражение по вертикали
-					channel = channel < 6 ? channel + 6 : channel - 6; // Свап цветов
-				}
-
-				if (channel !== undefined) {
-					data[offset + channel * 64 + actualRow * 8 + col] = 1.0;
-				}
-				col++;
-			}
-		}
-
-		// --- 2. ОЧЕРЕДЬ ХОДА ---
-		// В твоем features.py это просто слой из 1.0, так как сеть всегда "ходит своими"
-		data.fill(1.0, offset + 12 * 64, offset + 13 * 64);
-
-		// --- 3. РОКИРОВКА ---
-		const cStr = parts[2] || "-";
-		const K = cStr.includes("K") ? 1.0 : 0.0;
-		const Q = cStr.includes("Q") ? 1.0 : 0.0;
-		const k = cStr.includes("k") ? 1.0 : 0.0;
-		const q = cStr.includes("q") ? 1.0 : 0.0;
-
-		const ourShort = isBlackTurn ? k : K;
-		const ourLong = isBlackTurn ? q : Q;
-		const oppShort = isBlackTurn ? K : k;
-		const oppLong = isBlackTurn ? Q : q;
-
-		const castlingOffset = offset + 13 * 64;
-		data[castlingOffset + 7 * 8 + 7] = ourShort;
-		data[castlingOffset + 7 * 8 + 0] = ourLong;
-		data[castlingOffset + 0 * 8 + 7] = oppShort;
-		data[castlingOffset + 0 * 8 + 0] = oppLong;
-
-		// --- 4. ВЗЯТИЕ НА ПРОХОДЕ (EN PASSANT) ---
-		if (parts[3] !== "-") {
-			const epCol = parts[3].charCodeAt(0) - 97; // 'a' это 97
-			let epRow = 8 - parseInt(parts[3][1], 10);
-
-			if (isBlackTurn) epRow = 7 - epRow; // Отражение по вертикали (^ 56 в питоне)
-
-			const epOffset = offset + 14 * 64;
-			data[epOffset + epRow * 8 + epCol] = 1.0;
+			tensorData[channel * 64 + sq] = 1.0;
+			file++;
 		}
 	}
 
-	return new ort.Tensor("float32", data, [batchSize, 15, 8, 8]);
-}
-
-export function decodeEvaluations(
-	logits: Float32Array,
-	batchSize: number,
-): number[] {
-	const scores: number[] = [];
-	const WDL_SCALE = 3.0; // Берем из твоего consts.py!
-
-	for (let b = 0; b < batchSize; b++) {
-		const rawLogit = logits[b];
-
-		if (rawLogit === undefined || Number.isNaN(rawLogit)) {
-			scores.push(0);
-			continue;
-		}
-
-		let p = 1.0 / (1.0 + Math.exp(-rawLogit));
-		p = Math.max(1e-4, Math.min(1.0 - 1e-4, p));
-
-		const pawns = -WDL_SCALE * Math.log(1.0 / p - 1.0);
-
-		scores.push(pawns);
+	// 2. СЛОЙ 12: ОЧЕРЕДЬ ХОДА (Всегда заполняем единицами, как в Python)
+	const ch12 = 12 * 64;
+	for (let i = 0; i < 64; i++) {
+		tensorData[ch12 + i] = 1.0;
 	}
 
-	return scores;
+	// 3. СЛОЙ 13: РОКИРОВКИ
+	const ch13 = 13 * 64;
+	if (isWhiteTurn) {
+		if (castling.includes("K")) tensorData[ch13 + 63] = 1.0; // Своя короткая (7,7)
+		if (castling.includes("Q")) tensorData[ch13 + 56] = 1.0; // Своя длинная (7,0)
+		if (castling.includes("k")) tensorData[ch13 + 7] = 1.0; // Чужая короткая (0,7)
+		if (castling.includes("q")) tensorData[ch13 + 0] = 1.0; // Чужая длинная (0,0)
+	} else {
+		// При перевороте доски, рокировки тоже "меняются местами"
+		if (castling.includes("k")) tensorData[ch13 + 63] = 1.0;
+		if (castling.includes("q")) tensorData[ch13 + 56] = 1.0;
+		if (castling.includes("K")) tensorData[ch13 + 7] = 1.0;
+		if (castling.includes("Q")) tensorData[ch13 + 0] = 1.0;
+	}
+
+	// 4. СЛОЙ 14: ВЗЯТИЕ НА ПРОХОДЕ (En Passant)
+	if (epStr !== "-") {
+		const col = epStr.charCodeAt(0) - "a".charCodeAt(0);
+		const fenRow = 8 - parseInt(epStr[1], 10); // 0-based сверху
+		const mappedRow = isWhiteTurn ? fenRow : 7 - fenRow;
+
+		tensorData[14 * 64 + mappedRow * 8 + col] = 1.0;
+	}
+
+	// Возвращаем объект с ключом 'input' (так мы назвали его при экспорте в ONNX)
+	return {
+		input: new ort.Tensor("float32", tensorData, [1, 15, 8, 8]),
+	};
 }
