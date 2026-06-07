@@ -7,17 +7,19 @@ def export_model_to_onnx():
     model.load_state_dict(torch.load("best_chess_model.pth", map_location=device, weights_only=True))
     model.eval()
 
-    # Используем динамический batch (первое измерение), чтобы ONNX поддерживал батчинг
-    # Use a small batch >1 so ONNX export records batched ops correctly
+    # Используем динамический batch (первое измерение)
     dummy_input = torch.randn(4, 15, 8, 8, device=device)
 
     dynamic_axes = {
         'input': {0: 'batch'},
-        'score': {0: 'batch'}, # <--- Изменили
-        'mate': {0: 'batch'}   # <--- Добавили
+        'score': {0: 'batch'}, 
+        'mate': {0: 'batch'}   
     }
 
     out_path = "chess_model.onnx"
+    
+    print("Trwa eksportowanie modelu do ONNX...")
+    # Оставляем только ОДИН правильный вызов экспорта
     torch.onnx.export(
         model,
         dummy_input,
@@ -25,28 +27,17 @@ def export_model_to_onnx():
         export_params=True,
         opset_version=18,
         input_names=['input'],
-        output_names=['score', 'mate'], # <--- Изменили
+        output_names=['score', 'mate'], 
         dynamic_axes=dynamic_axes
     )
 
-    out_path = "chess_model.onnx"
-    torch.onnx.export(
-        model,
-        dummy_input,
-        out_path,
-        export_params=True,
-        opset_version=18,
-        input_names=['input'],
-        output_names=['output'],
-        dynamic_axes=dynamic_axes
-    )
-
-    # Also copy the exported ONNX to the webapp models folder so the Next server can load it
+    # Копируем в папку Next.js
     try:
         import shutil, os
-        target_dir = os.path.join(os.getcwd(), "webapp", "models")
+        target_dir = os.path.join(os.getcwd(), "..", "webapp", "models")
         os.makedirs(target_dir, exist_ok=True)
         shutil.copy(out_path, os.path.join(target_dir, "chess_model.onnx"))
-        print(f"✅ chess_model.onnx exported and copied to {target_dir}")
+        shutil.copy(out_path + ".data", os.path.join(target_dir, "chess_model.onnx.data"))
+        print(f"✅ chess_model.onnx i chess_model.onnx.data wyeksportowano i skopiowano do {target_dir}")
     except Exception as e:
-        print("⚠️ Exported ONNX but failed to copy to webapp/models:", e)
+        print("⚠️ Wyeksportowano ONNX, ale nie udało się skopiować do webapp/models:", e)

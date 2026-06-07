@@ -6,46 +6,53 @@ import { createResNetTensor } from "@/lib/tensor"; // <--- ОБНОВЛЕНО
 const evalCache = new Map<string, number>();
 
 async function evaluatePosition(fen: string, session: any): Promise<number> {
-	// Убираем счетчики полуходов для кэширования
 	const cleanFen = fen.split(" ").slice(0, 4).join(" ");
 	if (evalCache.has(cleanFen)) return evalCache.get(cleanFen)!;
 
-	// Создаем правильный 3D тензор
+	const isWhiteTurn = fen.split(" ")[1] === "w";
 	const feeds = createResNetTensor(fen);
 	const results = await session.run(feeds);
 
-	// Читаем две головы из Трансформера
 	const rawScore = (results["score"].data as Float32Array)[0];
 	const mateLogit = (results["mate"].data as Float32Array)[0];
-
 	const mateProb = 1 / (1 + Math.exp(-mateLogit));
 
 	let finalScore = rawScore;
 
-	// Матовый приоритет
-	if (mateProb > 0.85) {
-		finalScore = rawScore > 0 ? 30.0 : -30.0;
+	if (mateProb > 0.75) {
+		// --- ЭФФЕКТ КОМПАСА ---
+		// Если пахнет матом, мы ПОЛНОСТЬЮ игнорируем сырые пешки (чтобы избежать скачков 12..50).
+		// Мы строим оценку только на уверенности сети в мате.
+		// Вероятность (0.75...0.99) даст плавный рост оценки (27.5 ... 29.9).
+		// Бот будет карабкаться по этой "горке" прямо к шее короля!
+		const mateScore = 20.0 + mateProb * 10.0;
+		finalScore = rawScore > 0 ? mateScore : -mateScore;
+	} else {
+		// В обычной игре (миттельшпиль) жестко срезаем галлюцинации до 15 пешек
+		finalScore = Math.max(-15.0, Math.min(15.0, rawScore));
 	}
 
-	evalCache.set(cleanFen, finalScore);
-	return finalScore;
+	const absoluteScore = isWhiteTurn ? finalScore : -finalScore;
+	evalCache.set(cleanFen, absoluteScore);
+	return absoluteScore;
 }
 
-// Упорядочивание ходов (КРИТИЧЕСКИ ВАЖНО ДЛЯ АЛЬФА-БЕТЫ)
-// Если мы сначала смотрим хорошие ходы, альфа-бета отсекает 90% дерева
-function orderMoves(game: Chess, moves: string[]) {
+// Упорядочивание ходов (КРИТИЧЕСКИ ВАЖНО)
+function orderMoves(moves: string[]) {
 	return moves.sort((a, b) => {
 		let scoreA = 0,
 			scoreB = 0;
-		if (a.includes("x")) scoreA += 10; // Взятия проверяем первыми
-		if (a.includes("+")) scoreA += 5; // Шахи
+		if (a.includes("#")) scoreA += 1000;
+		if (b.includes("#")) scoreB += 1000;
+		if (a.includes("+")) scoreA += 50;
+		if (b.includes("+")) scoreB += 50;
+		if (a.includes("x")) scoreA += 10;
 		if (b.includes("x")) scoreB += 10;
-		if (b.includes("+")) scoreB += 5;
 		return scoreB - scoreA;
 	});
 }
 
-// Классический Alpha-Beta поиск
+// Классический Alpha-Beta поиск + Beam Search
 async function alphaBeta(
 	game: Chess,
 	depth: number,
@@ -56,26 +63,31 @@ async function alphaBeta(
 ): Promise<number> {
 	if (depth === 0 || game.isGameOver()) {
 		if (game.isCheckmate())
-			// ВАЖНО: + depth заставляет движок предпочитать БЫСТРЫЕ маты
-			// MateScore (10000) перебивает любые пешки (30.0)
-			return isWhite ? -(10000 + depth) : 10000 + depth;
+			return isWhite ? -(100000 + depth) : 100000 + depth;
 		if (game.isDraw()) return 0;
 
-		if (depth === 0) {
-			return await evaluatePosition(game.fen(), session);
-		}
-
-		// В идеале здесь должен быть Quiescence Search,
-		// но для начала просто вызываем нейросеть
 		return await evaluatePosition(game.fen(), session);
 	}
 
 	const moves = game.moves();
-	orderMoves(game, moves); // Сортируем ходы для максимального отсечения
+	orderMoves(moves);
+
+	// --- BEAM SEARCH (ЛУЧЕВОЙ ПОИСК) ---
+	// Сокращаем ширину дерева: берем все агрессивные ходы + максимум 5 тихих
+	let limitedMoves = [];
+	let quietCount = 0;
+	for (const m of moves) {
+		if (m.includes("+") || m.includes("#") || m.includes("x")) {
+			limitedMoves.push(m);
+		} else if (quietCount < 5) {
+			limitedMoves.push(m);
+			quietCount++;
+		}
+	}
 
 	if (isWhite) {
 		let maxEval = -Infinity;
-		for (const move of moves) {
+		for (const move of limitedMoves) {
 			game.move(move);
 			const ev = await alphaBeta(
 				game,
@@ -89,12 +101,12 @@ async function alphaBeta(
 
 			maxEval = Math.max(maxEval, ev);
 			alpha = Math.max(alpha, ev);
-			if (beta <= alpha) break; // Отсечение ветки!
+			if (beta <= alpha) break; // Отсечение!
 		}
 		return maxEval;
 	} else {
 		let minEval = Infinity;
-		for (const move of moves) {
+		for (const move of limitedMoves) {
 			game.move(move);
 			const ev = await alphaBeta(
 				game,
@@ -108,7 +120,7 @@ async function alphaBeta(
 
 			minEval = Math.min(minEval, ev);
 			beta = Math.min(beta, ev);
-			if (beta <= alpha) break; // Отсечение ветки!
+			if (beta <= alpha) break; // Отсечение!
 		}
 		return minEval;
 	}
@@ -117,14 +129,26 @@ async function alphaBeta(
 async function getBestMove(fen: string, depth: number, session: any) {
 	const game = new Chess(fen);
 	const moves = game.moves();
-	let bestMove = moves[0];
-	const isWhite = game.turn() === "w";
+	orderMoves(moves);
 
+	// Применяем то же отсечение на верхнем уровне
+	let limitedMoves = [];
+	let quietCount = 0;
+	for (const m of moves) {
+		if (m.includes("+") || m.includes("#") || m.includes("x")) {
+			limitedMoves.push(m);
+		} else if (quietCount < 5) {
+			limitedMoves.push(m);
+			quietCount++;
+		}
+	}
+
+	let bestMove = limitedMoves[0];
+	const isWhite = game.turn() === "w";
 	let bestValue = isWhite ? -Infinity : Infinity;
 
-	for (const move of moves) {
+	for (const move of limitedMoves) {
 		game.move(move);
-		// Запускаем поиск для ветки
 		const boardValue = await alphaBeta(
 			game,
 			depth - 1,
@@ -159,7 +183,6 @@ export async function POST(req: Request) {
 		const searchDepth = parseInt(body.searchDepth) || 1;
 
 		const session = await getModelSession();
-
 		let bestMoveResult;
 
 		if (searchMode === "advanced" && searchDepth > 1) {
