@@ -4,16 +4,6 @@ from tqdm import tqdm
 from typing import List
 
 from core.features import fen_to_tensor, build_batch_on_gpu
-from core.consts import WDL_SCALE
-
-def prob_to_pawns(prob_tensor: torch.Tensor) -> torch.Tensor:
-    """Обратная конвертация: Вероятность (0..1) -> Пешки с защитой от выбросов."""
-    # Защита от деления на ноль / логарифма нуля (обрезаем 0.001 ... 0.999)
-    p = torch.clamp(prob_tensor, min=1e-4, max=1.0 - 1e-4)
-    pawns = -WDL_SCALE * torch.log((1.0 / p) - 1.0)
-    
-    # ЖЕСТКАЯ ОБРЕЗКА: Не даем пешкам улетать в бесконечность при 99% вероятности
-    return torch.clamp(pawns, min=-10.0, max=10.0)
 
 def predict_evaluation(model: nn.Module, fens: List[str]) -> List[float]:
     if not fens:
@@ -24,12 +14,9 @@ def predict_evaluation(model: nn.Module, fens: List[str]) -> List[float]:
     inputs = torch.stack([fen_to_tensor(fen) for fen in fens]).to(device)
 
     with torch.no_grad():
-        out = model(inputs)
-        # collapse extra output dims to a single scalar per sample (robust to different value_head shapes)
-        if out.ndim > 1:
-            out = out.view(out.size(0), -1).mean(dim=1)
-        probs = torch.sigmoid(out)
-        expected_evals = prob_to_pawns(probs).tolist()
+        score_preds, _ = model(inputs)
+        # Получаем сырые пешки
+        expected_evals = score_preds.view(-1).tolist()
 
     # Инвертируем оценку обратно для интерфейса (если ход черных)
     for i, fen in enumerate(fens):
@@ -55,20 +42,13 @@ def evaluate_model_metrics(model: torch.nn.Module, dataloader: torch.utils.data.
             
             batch_inputs = build_batch_on_gpu(boards, turns, castling, eps)
 
-            batch_targets_canonical = torch.where(turns == 0, 1.0 - batch_targets, batch_targets)
+            # Пешки инвертируются через минус (а не через 1.0 - x)
+            batch_targets_canonical = torch.where(turns == 0, -batch_targets, batch_targets)
 
-            out = model(batch_inputs)
-            if out.ndim > 1:
-                out = out.view(out.size(0), -1).mean(dim=1)
+            score_preds, _ = model(batch_inputs)
 
-            probs = torch.sigmoid(out)
-
-            preds_pawns = prob_to_pawns(probs)
-            targets_pawns = prob_to_pawns(batch_targets_canonical)
-
-            # ensure both are 1D tensors of shape (batch,)
-            preds_pawns = preds_pawns.view(-1)
-            targets_pawns = targets_pawns.view(-1)
+            preds_pawns = score_preds.view(-1)
+            targets_pawns = batch_targets_canonical.view(-1)
 
             mae = torch.abs(preds_pawns - targets_pawns).sum().item()
             total_mae_pawns += mae
@@ -102,25 +82,20 @@ def show_model_stats(model, val_loader, df):
     just_fens = [item[0] for item in test_positions]
     evaluations = predict_evaluation(model, just_fens)
 
-    # Списки для подсчета средней ошибки по диапазонам
-    # Бины: symmetric ranges specified by user: 1,2,3,5,7,10
     bins = [0, 2, 5, 7, 10, 15, 100]
-    # prepare container for each bin (center, then increasing rings)
     bin_diffs = {i: [] for i in range(len(bins)-1)}
 
     print("\nWyniki oceny przez sieć neuronową:")
     for [fen, correct_eval], eval_score in zip(test_positions, evaluations):
         eval_str = str(correct_eval).strip()
         if eval_str.startswith('#'):
-            true_pawns = 10.0 if eval_str[1] == '+' else -10.0
+            true_pawns = 30.0 if eval_str[1] == '+' else -30.0
         else:
             true_pawns = float(eval_str) / 100.0
             
         diff = abs(eval_score - true_pawns)
 
-        # Распределяем ошибку по симметричным корзинам на основе абсолютной истинной оценки
         a = abs(true_pawns)
-        # Найдём bin: first bin includes [0..1], next bins are (1..2], (2..3], (3..5], (5..7], (7..10]
         for i in range(len(bins)-1):
             low = bins[i]
             high = bins[i+1]
@@ -132,18 +107,10 @@ def show_model_stats(model, val_loader, df):
                 if low < a <= high:
                     bin_diffs[i].append(diff)
                     break
-            
-        short_fen = fen.split()[0]
-        if len(short_fen) > 30:
-            short_fen = short_fen[:27] + "..."
-            
-        # print(f"FEN: {short_fen:<30} | Model: {eval_score:>6.2f} | Prawdziwa: {true_pawns:>6.2f} | Błąd: {diff:>5.2f} piona")
 
-    # === ВЫВОД РАЗНИЦЫ ПО ДИАПАЗОНАМ ===
     print("\n" + "="*75)
     print("📊 Statystyki szczegółowe (na podstawie 1000 pozycji):")
 
-    # Формат вывода для каждой пары симметричных диапазонов
     labels = ["[-2..2]", "(2..5]", "(5..7]", "(7..10]", "(10..15]", "(15..100]"]
     for i, label in enumerate(labels):
         vals = bin_diffs.get(i, [])
@@ -154,5 +121,4 @@ def show_model_stats(model, val_loader, df):
             print(f"  {label:8}  Brak pozycji (Pozycji: 0)")
 
     print("="*75 + "\n")
-
     evaluate_model_metrics(model, val_loader, device)
