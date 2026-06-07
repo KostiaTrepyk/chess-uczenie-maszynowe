@@ -59,8 +59,8 @@ def main():
     
     print(f"Dane załadowane: {train_size} treningowych, {val_size} walidacyjnych.")
 
-    train_loader = FastTensorDataLoader(train_dataset, batch_size=4096*16, shuffle=True)
-    val_loader = FastTensorDataLoader(val_dataset, batch_size=4096*16, shuffle=False)
+    train_loader = FastTensorDataLoader(train_dataset, batch_size=4096*2, shuffle=True)
+    val_loader = FastTensorDataLoader(val_dataset, batch_size=4096*2, shuffle=False)
 
     print("Inicjalizacja modelu i rozpoczęcie treningu...")
     trained_model = train_nnue(train_loader, val_loader)

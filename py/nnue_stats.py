@@ -23,7 +23,7 @@ def main():
         return
 
     total_size = len(full_dataset)
-    train_size = int(0.98 * total_size)
+    train_size = int(0.9 * total_size)
     val_size = total_size - train_size
     
     # Использование manual_seed(42) обязательно, чтобы не смешать Train и Val!

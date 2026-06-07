@@ -7,6 +7,8 @@ from tqdm import tqdm
 
 checks_per_epoch = 1
 max_val_batches = 300
+MAX_PAWN_SCORE = 30
+epochs = 90
 
 CHAR_TO_W = {'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'p': 5, 'n': 6, 'b': 7, 'r': 8, 'q': 9}
 CHAR_TO_B = {'p': 0, 'n': 1, 'b': 2, 'r': 3, 'q': 4, 'P': 5, 'N': 6, 'B': 7, 'R': 8, 'Q': 9}
@@ -62,25 +64,47 @@ def parse_fen_for_nnue(fen: str):
         
     return w_indices, b_indices, state
 
+class ResBlock(nn.Module):
+    def __init__(self, size):
+        super().__init__()
+        self.fc1 = nn.Linear(size, size)
+        self.fc2 = nn.Linear(size, size)
+
+    def forward(self, x):
+        residual = x
+        out = torch.clamp(self.fc1(x), 0.0, 1.0)
+        out = self.fc2(out)
+        # Прибавляем вход к выходу (Skip-Connection)
+        return torch.clamp(out + residual, 0.0, 1.0)
+
 class ChessNNUE(nn.Module):
     def __init__(self):
         super().__init__()
         
-        # 1. Возвращаем полноценную память (256 каналов)
         self.feature_transformer = nn.EmbeddingBag(
             num_embeddings=41025, 
-            embedding_dim=256, 
+            embedding_dim=1024,  
             mode='sum', 
             padding_idx=41024
         )
         
-        # 2. Утяжеленная глубокая архитектура (518 -> 512 -> 128 -> 32 -> 1)
-        self.fc1 = nn.Linear(518, 512)
+        # Делаем стартовые веса крошечными, чтобы градиент мог пройти через clamp
+        nn.init.normal_(self.feature_transformer.weight, mean=0.0, std=0.01)
+        
+        # Основной мозг
+        self.fc1 = nn.Linear(2054, 512)
+        
+        # --- ДОБАВЛЯЕМ ВЕС МЫШЛЕНИЯ (RESNET) ---
+        self.res1 = ResBlock(512)
+        self.res2 = ResBlock(512)
+        self.res3 = ResBlock(512) # Три блока сделают ее невероятно глубокой
+        
         self.fc2 = nn.Linear(512, 128)
         self.fc3 = nn.Linear(128, 32)
-        self.output = nn.Linear(32, 1)
+        
+        self.score_out = nn.Linear(32, 1) 
+        self.mate_out = nn.Linear(32, 1)  
 
-        # Инициализация Kaiming отлично подходит для ReLU
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
@@ -88,18 +112,22 @@ class ChessNNUE(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, w_indices, b_indices, state):
-        # Аккумулятор оставляем с обычным Clipped ReLU для стабильности
         acc_w = torch.clamp(self.feature_transformer(w_indices), 0.0, 1.0)
         acc_b = torch.clamp(self.feature_transformer(b_indices), 0.0, 1.0)
         
         x = torch.cat([acc_w, acc_b, state], dim=1)
         
-        # 3. Применяем Squared Clipped ReLU для всех скрытых слоев
-        x = torch.pow(torch.clamp(self.fc1(x), 0.0, 1.0), 2)
-        x = torch.pow(torch.clamp(self.fc2(x), 0.0, 1.0), 2)
-        x = torch.pow(torch.clamp(self.fc3(x), 0.0, 1.0), 2)
+        # Прогоняем через новую архитектуру
+        x = torch.clamp(self.fc1(x), 0.0, 1.0)
+        
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.res3(x)
+        
+        x = torch.clamp(self.fc2(x), 0.0, 1.0)
+        x = torch.clamp(self.fc3(x), 0.0, 1.0)
 
-        return self.output(x)
+        return self.score_out(x), self.mate_out(x)
 
 class NNUEChessDataset(Dataset):
     def __init__(self, data_file_path: str):
@@ -110,7 +138,7 @@ class NNUEChessDataset(Dataset):
         cache_path = path + ".cache_v2.pt" 
         
         if os.path.exists(cache_path):
-            print(f"🚀 Znaleziono plik cache v2: {cache_path}.")
+            print(f"🚀 Znaleziono plik cache: {cache_path}.")
             cache_dict = torch.load(cache_path, weights_only=False)
             self.w_indices = cache_dict['w']
             self.b_indices = cache_dict['b']
@@ -122,32 +150,42 @@ class NNUEChessDataset(Dataset):
         with open(path, 'r', encoding='utf-8') as f:
             num_lines = sum(1 for _ in f)
 
-        self.w_indices = torch.full((num_lines, 32), 41024, dtype=torch.int32)
-        self.b_indices = torch.full((num_lines, 32), 41024, dtype=torch.int32)
-        self.states = torch.zeros((num_lines, 6), dtype=torch.float32)
-        self.targets = torch.zeros((num_lines, 1), dtype=torch.float32)
+        # 1. Выделяем память с запасом 30% под дубликаты
+        max_capacity = int(num_lines * 1.3)
+        self.w_indices = torch.full((max_capacity, 32), 41024, dtype=torch.int32)
+        self.b_indices = torch.full((max_capacity, 32), 41024, dtype=torch.int32)
+        self.states = torch.zeros((max_capacity, 6), dtype=torch.float32)
+        self.targets = torch.zeros((max_capacity, 1), dtype=torch.float32)
 
         valid_idx = 0
         with open(path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
-            for row in tqdm(reader, total=num_lines, desc="Przetwarzanie FEN"):
+            for row in tqdm(reader, total=num_lines, desc="Przetwarzanie FEN z HEM"):
                 if len(row) < 2: continue
                 try:
                     score_str = row[1].strip()
-                    cp_score = 2000 if '#' in score_str and not score_str.startswith('-') else -2000 if '#' in score_str else int(float(score_str))
-                    cp_score = max(-2000, min(2000, cp_score))
+                    cp_score = MAX_PAWN_SCORE * 100 if '#' in score_str and not score_str.startswith('-') else -MAX_PAWN_SCORE * 100 if '#' in score_str else int(float(score_str))
+                    cp_score = max(-MAX_PAWN_SCORE * 100, min(MAX_PAWN_SCORE * 100, cp_score))
                     pawn_score = cp_score / 100.0
+                    
+                    # --- HARD EXAMPLE MINING ---
+                    # Если перевес больше 8 пешек или это мат, дублируем позицию 4 раза
+                    repeats = 4 if abs(pawn_score) >= 8.0 else 1
                     
                     w_idx, b_idx, state = parse_fen_for_nnue(row[0].strip())
                     if not w_idx or not b_idx: continue
                     
                     length = min(len(w_idx), 32)
-                    self.w_indices[valid_idx, :length] = torch.IntTensor(w_idx[:length])
-                    self.b_indices[valid_idx, :length] = torch.IntTensor(b_idx[:length])
-                    self.states[valid_idx] = torch.FloatTensor(state)
-                    self.targets[valid_idx, 0] = pawn_score 
                     
-                    valid_idx += 1
+                    # Записываем в память с учетом повторений
+                    for _ in range(repeats):
+                        if valid_idx >= max_capacity: break
+                        self.w_indices[valid_idx, :length] = torch.IntTensor(w_idx[:length])
+                        self.b_indices[valid_idx, :length] = torch.IntTensor(b_idx[:length])
+                        self.states[valid_idx] = torch.FloatTensor(state)
+                        self.targets[valid_idx, 0] = pawn_score 
+                        valid_idx += 1
+                        
                 except ValueError:
                     continue
                     
@@ -177,8 +215,12 @@ def train_nnue(train_loader, val_loader) -> ChessNNUE:
     torch.backends.cudnn.benchmark = True
     model = ChessNNUE().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
-    loss_fn = nn.SmoothL1Loss() 
-    epochs = 150
+    
+    loss_wdl_fn = nn.MSELoss()
+    loss_pawns_fn = nn.SmoothL1Loss(beta=1.0)
+    loss_mate_fn = nn.BCEWithLogitsLoss()
+    alpha = 2.0
+    
     patience = 30 * checks_per_epoch  
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -187,7 +229,7 @@ def train_nnue(train_loader, val_loader) -> ChessNNUE:
     scaler = torch.amp.GradScaler('cuda')
     
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=0.01, epochs=epochs,
+        optimizer, max_lr=0.001, epochs=epochs,
         steps_per_epoch=total_batches, pct_start=0.1,
         div_factor=10.0, final_div_factor=1000.0
     )
@@ -199,12 +241,27 @@ def train_nnue(train_loader, val_loader) -> ChessNNUE:
         train_pbar = tqdm(train_loader, desc=f"Epoka {epoch+1}/{epochs} [Train]", leave=False)
         
         for step, batch_data in enumerate(train_pbar):
-            w_idx, b_idx, states, targets = [x.to(device, non_blocking=True) for x in batch_data]
+            w_idx, b_idx, states, targets_pawns = [x.to(device, non_blocking=True) for x in batch_data]
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda'):
-                predictions = model(w_idx, b_idx, states)
-                loss = loss_fn(predictions, targets)
+                # Получаем два предсказания
+                score_preds, mate_preds = model(w_idx, b_idx, states)
+
+                # 1. WDL-составляющая (гениальность в сложных позициях)
+                preds_wdl = torch.sigmoid(score_preds / 4.0)
+                targets_wdl = torch.sigmoid(targets_pawns / 4.0)
+                loss_wdl = loss_wdl_fn(preds_wdl, targets_wdl)
+            
+                # 2. Пешечная составляющая (жадность до мата)
+                loss_pawns = loss_pawns_fn(score_preds, targets_pawns)
+            
+                # 3. Матовая составляющая
+                targets_mate = (torch.abs(targets_pawns) > 15.0).float()
+                loss_mate = loss_mate_fn(mate_preds, targets_mate)
+            
+                # ИТОГОВЫЙ ЛОСС: 80% WDL + 20% Пешки + Маты
+                loss = (0.8 * loss_wdl) + (0.2 * loss_pawns) + (alpha * loss_mate)
 
             scaler.scale(loss).backward()
             if scaler.is_enabled():
@@ -230,8 +287,25 @@ def train_nnue(train_loader, val_loader) -> ChessNNUE:
                     for val_data in val_pbar:
                         if val_steps_taken >= max_val_batches: break 
                         v_w_idx, v_b_idx, v_states, v_targets = [x.to(device, non_blocking=True) for x in val_data]
-                        val_preds = model(v_w_idx, v_b_idx, v_states)
-                        v_loss = loss_fn(val_preds, v_targets)
+                        
+                        # Распаковываем 2 выхода
+                        v_score_preds, v_mate_preds = model(v_w_idx, v_b_idx, v_states)
+                        
+                        # 1. WDL-составляющая (вероятности)
+                        v_preds_wdl = torch.sigmoid(v_score_preds / 4.0)
+                        v_targets_wdl = torch.sigmoid(v_targets / 4.0)
+                        v_loss_wdl = loss_wdl_fn(v_preds_wdl, v_targets_wdl)
+                        
+                        # 2. Пешечная составляющая
+                        v_loss_pawns = loss_pawns_fn(v_score_preds, v_targets)
+                        
+                        # 3. Матовая составляющая
+                        v_targets_mate = (torch.abs(v_targets) > 15.0).float()
+                        v_loss_mate = loss_mate_fn(v_mate_preds, v_targets_mate)
+                        
+                        # Итоговый лосс валидации
+                        v_loss = (0.8 * v_loss_wdl) + (0.2 * v_loss_pawns) + (alpha * v_loss_mate)
+                        
                         val_loss += v_loss.item()
                         val_steps_taken += 1
                         val_pbar.set_postfix({'loss': f"{v_loss.item():.4f}"})
@@ -261,7 +335,6 @@ def train_nnue(train_loader, val_loader) -> ChessNNUE:
     model.eval()
     return model
 
-
 def evaluate_nnue(model: ChessNNUE, dataloader, device: torch.device) -> tuple[float, float]:
     model.eval()
     correct_signs = 0
@@ -284,7 +357,8 @@ def evaluate_nnue(model: ChessNNUE, dataloader, device: torch.device) -> tuple[f
         for i, batch_data in enumerate(eval_pbar):
             w_idx, b_idx, states, targets_pawns = [x.to(device, non_blocking=True) for x in batch_data]
 
-            preds_pawns = model(w_idx, b_idx, states)
+            # Игнорируем второй выход (_) для статистики
+            preds_pawns, _ = model(w_idx, b_idx, states)
 
             # Вывод первых позиций для визуального контроля (в пешках)
             if i == 0:
