@@ -76,7 +76,7 @@ def show_model_stats(model, val_loader, df):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     test_positions = [
-        [df["FEN"].iloc[i], df["Evaluation"].iloc[i]] for i in range(1000)
+        [df["FEN"].iloc[i], df["Evaluation"].iloc[i]] for i in range(5000)
     ]
     
     just_fens = [item[0] for item in test_positions]
@@ -109,7 +109,7 @@ def show_model_stats(model, val_loader, df):
                     break
 
     print("\n" + "="*75)
-    print("📊 Statystyki szczegółowe (na podstawie 1000 pozycji):")
+    print("📊 Statystyki szczegółowe (na podstawie 5000 pozycji):")
 
     labels = ["[-2..2]", "(2..5]", "(5..7]", "(7..10]", "(10..15]", "(15..100]"]
     for i, label in enumerate(labels):
