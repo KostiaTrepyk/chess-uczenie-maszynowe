@@ -9,12 +9,12 @@ export async function getModelSession(): Promise<ort.InferenceSession> {
 		
 		session = await ort.InferenceSession.create(modelPath, { 
 			executionProviders: ["cpu"],
-			graphOptimizationLevel: 'all', // Максимальная оптимизация графа
-			intraOpNumThreads: 4,          // Распараллеливание внутри одной операции (поставь по числу ядер)
+			graphOptimizationLevel: 'all', 
+			intraOpNumThreads: 0,  // <--- 0 = ИСПОЛЬЗОВАТЬ ВСЕ ЯДРА ПРОЦЕССОРА
 			executionMode: 'sequential'
 		});
 		
-		console.log("✅ Sesja ONNX (Zoptymalizowana) uruchomiona na CPU.");
+		console.log("✅ Sesja ONNX uruchomiona na CPU (Max Threads).");
 	}
 	return session;
 }

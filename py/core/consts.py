@@ -1,6 +1,6 @@
-NUM_BLOCKS = 20 # 10 20
+NUM_BLOCKS = 10 # 10 20
 CHANNELS = 256
-TransformerBlockHeads = 16
+TransformerBlockHeads = 8
 
 # 256 512
 BATCH_SIZE = 256

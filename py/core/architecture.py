@@ -61,18 +61,30 @@ class ChessResNet(nn.Module):
         self.resnet_blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(num_blocks)])
         self.transformer = nn.Sequential(*[TransformerBlock(channels=channels, heads=TransformerBlockHeads) for _ in range(num_transformer_blocks)])
         
-        # Общие признаки для оценки
+        # Общие признаки для оценки (расширяем выход до 512)
         self.value_features = nn.Sequential(
             nn.Conv2d(channels, 4, kernel_size=1),
             nn.BatchNorm2d(4),
             nn.LeakyReLU(0.1),
             nn.Flatten(),
-            nn.Linear(256, 256),
+            nn.Linear(256, 512), # <--- Немного расширили горлышко
             nn.LeakyReLU(0.1),
         )
-        # ДВЕ ГОЛОВЫ:
-        self.score_out = nn.Linear(256, 1) # Голова 1: Пешки
-        self.mate_out = nn.Linear(256, 1)  # Голова 2: Вероятность мата
+        
+        # --- НОВАЯ АРХИТЕКТУРА ГОЛОВ ---
+        # Голова 1: Точная оценка пешек (больше слоев)
+        self.score_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.1),
+            nn.Linear(256, 1)
+        )
+        
+        # Голова 2: Вероятность мата (меньше слоев)
+        self.mate_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.LeakyReLU(0.1),
+            nn.Linear(128, 1)
+        )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.input_conv(x)
@@ -81,8 +93,8 @@ class ChessResNet(nn.Module):
         
         features = self.value_features(x)
         
-        # Возвращаем кортеж из двух значений
-        return self.score_out(features).squeeze(-1), self.mate_out(features).squeeze(-1)
+        # Пропускаем через изолированные слои
+        return self.score_head(features).squeeze(-1), self.mate_head(features).squeeze(-1)
 
 def load_model(num_blocks=NUM_BLOCKS, channels=CHANNELS)-> ChessResNet:
     # Wczytujemy gotowy model

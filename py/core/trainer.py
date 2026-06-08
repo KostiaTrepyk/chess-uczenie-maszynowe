@@ -19,7 +19,7 @@ def train_model(train_loader: DataLoader, val_loader: DataLoader, resume_path: s
     loss_wdl_fn = nn.MSELoss(reduction='none')
     loss_pawns_fn = nn.SmoothL1Loss(beta=1.0, reduction='none')
     loss_mate_fn = nn.BCEWithLogitsLoss(reduction='none')
-    alpha = 2.0
+    alpha = 0.05
     best_val_loss = float('inf')
     start_lr = START_LR
     start_epoch = 0

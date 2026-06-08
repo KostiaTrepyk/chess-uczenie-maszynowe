@@ -56,6 +56,7 @@ export default function Home() {
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({
 						fen: currentGame.fen(),
+						history: currentGame.history(),
 						searchMode,
 						searchDepth,
 					}),
