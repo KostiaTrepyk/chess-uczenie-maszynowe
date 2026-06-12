@@ -29,7 +29,7 @@ A hybrid chess AI engine combining Deep Learning for position evaluation with cl
 - `python-chess` (Rules validation and dataset processing)
 
 **Web Application (Frontend / Engine AI):**
-- React 19 / Next.js 15
+- React 19 / Next.js 16
 - TypeScript
 - Tailwind CSS
 - `chess.js` (Move validation and game state)
