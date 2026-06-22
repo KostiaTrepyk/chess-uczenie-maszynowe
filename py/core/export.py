@@ -1,15 +1,22 @@
 import torch
+import os
+import shutil
 from core.architecture import ChessResNet
 
 def export_model_to_onnx():
+    # Ustawienie procesora (CPU) dla eksportu
     device = torch.device('cpu')
     model = ChessResNet().to(device)
+    
+    # Wczytanie najlepszych wag modelu
     model.load_state_dict(torch.load("best_chess_model.pth", map_location=device, weights_only=True))
+    
     model.eval()
 
-    # Используем динамический batch (первое измерение)
+    # Przykładowe wejście do wygenerowania grafu ONNX
     dummy_input = torch.randn(4, 15, 8, 8, device=device)
 
+    # Dynamiczny rozmiar partii (pozwala na zmienny batch size)
     dynamic_axes = {
         'input': {0: 'batch'},
         'score': {0: 'batch'}, 
@@ -19,7 +26,8 @@ def export_model_to_onnx():
     out_path = "chess_model.onnx"
     
     print("Trwa eksportowanie modelu do ONNX...")
-    # Оставляем только ОДИН правильный вызов экспорта
+    
+    # Eksport do formatu ONNX
     torch.onnx.export(
         model,
         dummy_input,
@@ -31,13 +39,20 @@ def export_model_to_onnx():
         dynamic_axes=dynamic_axes
     )
 
-    # Копируем в папку Next.js
-    try:
-        import shutil, os
+    # Przeniesienie plików do Next.js
+    try:    
         target_dir = os.path.join(os.getcwd(), "..", "webapp", "models")
+        
         os.makedirs(target_dir, exist_ok=True)
+        
+        # Kopiowanie głównego pliku modelu
         shutil.copy(out_path, os.path.join(target_dir, "chess_model.onnx"))
-        shutil.copy(out_path + ".data", os.path.join(target_dir, "chess_model.onnx.data"))
-        print(f"✅ chess_model.onnx i chess_model.onnx.data wyeksportowano i skopiowano do {target_dir}")
+        
+        # Kopiowanie pliku z wagami
+        data_path = out_path + ".data"
+        if os.path.exists(data_path):
+            shutil.copy(data_path, os.path.join(target_dir, "chess_model.onnx.data"))
+            
+        print(f"✅ pomyślnie wyeksportowano i skopiowano do {target_dir}")
     except Exception as e:
-        print("⚠️ Wyeksportowano ONNX, ale nie udało się skopiować do webapp/models:", e)
+        print("⚠️ Wyeksportowano ONNX, ale wystąpił błąd przy kopiowaniu:", e)
