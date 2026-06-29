@@ -1,0 +1,4 @@
+allowBuilds:
+  onnxruntime-node: false
+  sharp: false
+  unrs-resolver: false
